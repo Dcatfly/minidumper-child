@@ -15,3 +15,4 @@ uuid = {version = "1", features = ["v4"]}
 
 [dev-dependencies]
 sadness-generator = "0.7"
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }

@@ -230,8 +230,19 @@ fn run_unconnected_server(
     server_connect_timeout_ms: u64,
 ) -> (ExitStatus, Duration, Vec<String>) {
     let dir = TempDir::new(name);
-    let socket = dir.0.join("s");
+    run_unconnected_server_at(
+        &dir.0.join("s"),
+        client_connect_timeout_ms,
+        server_connect_timeout_ms,
+    )
+}
 
+/// Like [`run_unconnected_server`], with the given socket path.
+fn run_unconnected_server_at(
+    socket: &Path,
+    client_connect_timeout_ms: u64,
+    server_connect_timeout_ms: u64,
+) -> (ExitStatus, Duration, Vec<String>) {
     let mut command = example();
     command
         .env(SERVER_ENV, format!("path:{}", socket.display()))
@@ -281,6 +292,24 @@ fn server_exits_when_no_client_connects() {
         "server took {ran_for:?} to exit"
     );
     assert!(!output.iter().any(|line| line == "APP_CODE_RAN"));
+}
+
+#[test]
+fn server_removes_private_socket_dir() {
+    let dir = TempDir::new("priv");
+    // A directory named like the private directories the app process creates on Windows
+    let private_dir = dir.0.join("mdc-0123abcd");
+    fs::create_dir(&private_dir).unwrap();
+
+    let (status, _, output) = run_unconnected_server_at(&private_dir.join("s"), 500, 2500);
+
+    assert_eq!(status.code(), Some(0), "output: {output:?}");
+    assert!(
+        !private_dir.exists(),
+        "private socket directory was not removed"
+    );
+    // Only the private directory is removed
+    assert!(dir.0.is_dir());
 }
 
 #[test]

@@ -10,6 +10,8 @@ use std::{
 
 pub mod client;
 pub mod server;
+#[doc(hidden)]
+pub mod socket_dir;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -194,9 +196,11 @@ impl MinidumperChild {
             // Panics, e.g. from the `on_minidump` or `on_message` callbacks, are caught so
             // they don't unwind into the caller either. The panic hook still runs first,
             // and this has no effect when built with `panic = "abort"`.
+            let mut parsed_socket_name = None;
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let socket_name = OwnedSocketName::from_os_str(&socket_name)
                     .ok_or_else(|| Error::InvalidSocketName(socket_name.clone()))?;
+                parsed_socket_name = Some(socket_name.clone());
 
                 let connect_grace =
                     server_connect_grace(self.client_connect_timeout, self.server_connect_timeout);
@@ -211,6 +215,12 @@ impl MinidumperChild {
                 )
             }));
 
+            // The server removed its socket file when it was dropped, now remove the
+            // private directory the app process may have created for it
+            if let Some(socket_name) = &parsed_socket_name {
+                socket_dir::remove_private_socket_dir(socket_name);
+            }
+
             let code = match result {
                 Ok(Ok(())) => 0,
                 Ok(Err(err)) => {
@@ -224,7 +234,7 @@ impl MinidumperChild {
         } else {
             // We use a unique socket name because we don't share the crash reporter
             // processes between different instances of the app.
-            let socket_name = OwnedSocketName::new(&std::env::temp_dir(), uuid::Uuid::new_v4());
+            let socket_name = app_socket_name();
 
             let mut server_process = std::env::current_exe()
                 .and_then(|current_exe| {
@@ -276,7 +286,8 @@ fn write_error(err: &dyn std::error::Error) {
     let _ = writeln!(std::io::stderr(), "{message}");
 }
 
-/// Kills the server process, waits for it to exit and removes its socket file.
+/// Kills the server process, waits for it to exit and removes its socket file, and its
+/// private directory if it has one.
 ///
 /// This is best effort: errors are ignored because the caller is already returning an error.
 fn terminate_server(server_process: &mut process::Child, socket_name: &OwnedSocketName) {
@@ -291,6 +302,24 @@ fn terminate_server(server_process: &mut process::Child, socket_name: &OwnedSock
         #[cfg(any(target_os = "linux", target_os = "android"))]
         OwnedSocketName::Abstract(_) => {}
     }
+
+    socket_dir::remove_private_socket_dir(socket_name);
+}
+
+/// Returns a new socket name for the app process to pass to the server process.
+///
+/// Packaged apps on Windows use a location inside the package where connecting works,
+/// everything else uses the system temporary directory.
+#[doc(hidden)]
+pub fn app_socket_name() -> OwnedSocketName {
+    let session_id = uuid::Uuid::new_v4();
+
+    #[cfg(windows)]
+    if let Some(socket_name) = socket_dir::sys::packaged_socket_name(session_id) {
+        return socket_name;
+    }
+
+    OwnedSocketName::new(&std::env::temp_dir(), session_id)
 }
 
 /// The minimum amount by which the server connect grace period exceeds the client connect
@@ -409,7 +438,10 @@ mod tests {
 
     use uuid::Uuid;
 
-    use crate::{server_connect_grace, OwnedSocketName, MIN_SERVER_CONNECT_MARGIN};
+    use crate::{
+        app_socket_name, server_connect_grace, socket_dir, OwnedSocketName,
+        MIN_SERVER_CONNECT_MARGIN,
+    };
 
     #[test]
     fn owned_socket_name_roundtrip_new() {
@@ -504,6 +536,91 @@ mod tests {
             for configured in [None, Some(Duration::ZERO), Some(connect)] {
                 let grace = server_connect_grace(connect, configured);
                 assert!(grace >= connect + MIN_SERVER_CONNECT_MARGIN, "{connect:?}");
+            }
+        }
+    }
+
+    /// A server handler that doesn't do anything.
+    struct NoopHandler;
+
+    impl minidumper::ServerHandler for NoopHandler {
+        fn create_minidump_file(&self) -> Result<(std::fs::File, PathBuf), std::io::Error> {
+            Err(std::io::Error::other("not supported"))
+        }
+
+        fn on_minidump_created(
+            &self,
+            _result: Result<minidumper::MinidumpBinary, minidumper::Error>,
+        ) -> minidumper::LoopAction {
+            minidumper::LoopAction::Exit
+        }
+
+        fn on_message(&self, _kind: u32, _buffer: Vec<u8>) {}
+    }
+
+    #[test]
+    fn app_socket_name_accepts_connections() {
+        use std::sync::{atomic::AtomicBool, mpsc, Arc};
+
+        let socket_name = app_socket_name();
+
+        // The client waits for the server to answer on some platforms, so the server has to
+        // run. Both run on their own threads so a hang fails the test rather than blocking it.
+        let mut server = minidumper::Server::with_name(socket_name.as_ref()).expect("should bind");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_thread = std::thread::spawn({
+            let shutdown = shutdown.clone();
+            move || {
+                let result = server.run(Box::new(NoopHandler), &shutdown, None);
+                // Dropping the server removes the socket file
+                drop(server);
+                result.map_err(|err| err.to_string())
+            }
+        });
+
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn({
+            let socket_name = socket_name.clone();
+            move || {
+                let result = minidumper::Client::with_name(socket_name.as_ref())
+                    .map(drop)
+                    .map_err(|err| err.to_string());
+                let _ = sender.send(result);
+            }
+        });
+        let connected = receiver.recv_timeout(Duration::from_secs(10));
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        let server_result = server_thread.join().expect("server thread panicked");
+        socket_dir::remove_private_socket_dir(&socket_name);
+
+        assert_eq!(
+            connected,
+            Ok(Ok(())),
+            "client should connect to {socket_name:?}"
+        );
+        assert_eq!(server_result, Ok(()));
+        match &socket_name {
+            OwnedSocketName::Path(path) => assert!(!path.exists()),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            OwnedSocketName::Abstract(_) => {}
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn app_socket_name_is_unchanged_outside_windows() {
+        match app_socket_name() {
+            OwnedSocketName::Path(path) => {
+                assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+                let name = path.file_name().unwrap().to_str().unwrap();
+                assert!(name.starts_with("temp-socket-"), "{name}");
+                assert_eq!(name.len(), "temp-socket-".len() + 32);
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            OwnedSocketName::Abstract(name) => {
+                assert!(name.starts_with("temp-socket-"), "{name}");
+                assert_eq!(name.len(), "temp-socket-".len() + 32);
             }
         }
     }

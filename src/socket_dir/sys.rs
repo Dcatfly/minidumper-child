@@ -22,7 +22,7 @@ use windows_sys::{
                 SDDL_REVISION_1, SE_FILE_OBJECT,
             },
             GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-            PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+            PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
         },
         Storage::{
             FileSystem::{CreateDirectoryW, GetShortPathNameW},
@@ -30,7 +30,7 @@ use windows_sys::{
         },
         System::{
             Com::CoTaskMemFree,
-            SystemInformation::GetWindowsDirectoryW,
+            SystemInformation::GetSystemWindowsDirectoryW,
             Threading::{GetCurrentProcess, OpenProcessToken},
         },
         UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
@@ -180,14 +180,16 @@ pub fn short_path_name(path: &Path) -> io::Result<PathBuf> {
     Err(io::Error::other("GetShortPathNameW kept growing"))
 }
 
-/// Returns the Windows directory, e.g. `C:\Windows`.
+/// Returns the shared Windows directory, e.g. `C:\Windows`.
+///
+/// Unlike `GetWindowsDirectoryW` this is never a per-user directory on terminal servers.
 pub fn windows_dir() -> io::Result<PathBuf> {
     let mut len = 260u32;
 
     for _ in 0..4 {
         let mut buf = vec![0u16; len as usize];
         // SAFETY: The buffer holds `len` wide characters
-        let written = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), len) };
+        let written = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), len) };
         if written == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -200,40 +202,55 @@ pub fn windows_dir() -> io::Result<PathBuf> {
         len = written;
     }
 
-    Err(io::Error::other("GetWindowsDirectoryW kept growing"))
+    Err(io::Error::other("GetSystemWindowsDirectoryW kept growing"))
+}
+
+/// The `TOKEN_USER` of the current process, in a buffer aligned for it.
+pub(crate) struct CurrentTokenUser(Vec<u64>);
+
+impl CurrentTokenUser {
+    pub(crate) fn get() -> io::Result<Self> {
+        let mut token: HANDLE = ptr::null_mut();
+        // SAFETY: `GetCurrentProcess` returns a pseudo handle that doesn't need closing
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = OwnedHandle(token);
+
+        let mut len = 0u32;
+        // SAFETY: A zero length with a null buffer queries the required length
+        unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut len) };
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Use `u64` so the buffer is aligned for `TOKEN_USER`
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        // SAFETY: The buffer holds at least `len` bytes
+        if unsafe {
+            GetTokenInformation(token.0, TokenUser, buf.as_mut_ptr().cast(), len, &mut len)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self(buf))
+    }
+
+    /// Returns the user's SID, which points into this buffer.
+    pub(crate) fn sid(&self) -> PSID {
+        // SAFETY: The buffer was filled with a `TOKEN_USER` by `GetTokenInformation`
+        unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    }
 }
 
 /// Returns the SID of the user the process runs as, e.g. `S-1-5-21-…-1001`.
 pub fn current_user_sid() -> io::Result<String> {
-    let mut token: HANDLE = ptr::null_mut();
-    // SAFETY: `GetCurrentProcess` returns a pseudo handle that doesn't need closing
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let token = OwnedHandle(token);
-
-    let mut len = 0u32;
-    // SAFETY: A zero length with a null buffer queries the required length
-    unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut len) };
-    if len == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // Use `u64` so the buffer is aligned for `TOKEN_USER`
-    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
-    // SAFETY: The buffer holds at least `len` bytes
-    if unsafe { GetTokenInformation(token.0, TokenUser, buf.as_mut_ptr().cast(), len, &mut len) }
-        == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-
-    // SAFETY: On success the buffer starts with a `TOKEN_USER`
-    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let token_user = CurrentTokenUser::get()?;
 
     let mut sid_string: PWSTR = ptr::null_mut();
-    // SAFETY: `sid` points into `buf` which is still alive
-    if unsafe { ConvertSidToStringSidW(sid, &mut sid_string) } == 0 {
+    // SAFETY: The SID points into `token_user` which is still alive
+    if unsafe { ConvertSidToStringSidW(token_user.sid(), &mut sid_string) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let sid_string = LocalMem(sid_string.cast());
@@ -416,48 +433,171 @@ pub fn packaged_socket_name(session_id: uuid::Uuid) -> Option<OwnedSocketName> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, fs};
+    use std::fs;
 
     use super::*;
     use crate::socket_dir::is_private_dir_name;
 
-    /// Splits SDDL with an owner and a DACL into the owner, the DACL flags and the ACEs.
-    fn parse_sddl(sddl: &str) -> (String, String, BTreeSet<String>) {
-        let rest = sddl.strip_prefix("O:").expect("no owner");
-        let (owner, dacl) = rest.split_once("D:").expect("no DACL");
-        let (flags, aces) = dacl.split_at(dacl.find('(').unwrap_or(dacl.len()));
-        let aces = aces
-            .split(')')
-            .filter(|ace| !ace.is_empty())
-            .map(|ace| format!("{ace})"))
+    /// An ACE of a private directory as seen by the test.
+    struct AceCheck {
+        /// Allows full access, inherited by files and directories
+        full_access_inherited: bool,
+        is_user: bool,
+        is_system: bool,
+    }
+
+    /// The parts of a security descriptor the private directory test checks.
+    struct DirSecurity {
+        owner_is_user: bool,
+        dacl_protected: bool,
+        aces: Vec<AceCheck>,
+    }
+
+    /// Reads the owner and DACL of `path` and compares the SIDs in it with `EqualSid`, so
+    /// the result doesn't depend on how SIDs are abbreviated in SDDL.
+    fn dir_security(path: &Path) -> DirSecurity {
+        use windows_sys::Win32::{
+            Security::{
+                AclSizeInformation, Authorization::ConvertStringSidToSidW, EqualSid, GetAce,
+                GetAclInformation, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, ACL,
+                ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE, SE_DACL_PROTECTED,
+            },
+            Storage::FileSystem::FILE_ALL_ACCESS,
+        };
+
+        /// `ACCESS_ALLOWED_ACE_TYPE`, which needs another `windows-sys` feature
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+        let user = CurrentTokenUser::get().unwrap();
+
+        let system_string: Vec<u16> = "S-1-5-18".encode_utf16().chain(Some(0)).collect();
+        let mut system: PSID = ptr::null_mut();
+        // SAFETY: `system` receives memory that has to be freed with `LocalFree`
+        assert_ne!(
+            unsafe { ConvertStringSidToSidW(system_string.as_ptr(), &mut system) },
+            0
+        );
+        let system = LocalMem(system);
+
+        let wide = to_wide(path);
+        let mut owner: PSID = ptr::null_mut();
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `owner` and `dacl` point into `descriptor`, which is freed last
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(rc, ERROR_SUCCESS);
+        let descriptor = LocalMem(descriptor);
+        assert!(!dacl.is_null(), "no DACL");
+
+        // SAFETY: Both SIDs are valid
+        let owner_is_user = unsafe { EqualSid(owner, user.sid()) } != 0;
+
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        // SAFETY: The descriptor is valid
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) },
+            0
+        );
+
+        let mut size_info = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        // SAFETY: The DACL is valid and the buffer has the right size
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut size_info as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0
+        );
+
+        let inherit = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+        let aces = (0..size_info.AceCount)
+            .map(|index| {
+                let mut ace: *mut c_void = ptr::null_mut();
+                // SAFETY: The index is within the ACE count
+                assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
+                let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+
+                // SAFETY: Every ACE starts with a header
+                let header = unsafe { (*ace).Header };
+                if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                    return AceCheck {
+                        full_access_inherited: false,
+                        is_user: false,
+                        is_system: false,
+                    };
+                }
+
+                // SAFETY: This is an allow ACE, its SID starts at `SidStart`
+                let (mask, sid) = unsafe {
+                    (
+                        (*ace).Mask,
+                        ptr::addr_of_mut!((*ace).SidStart).cast::<c_void>(),
+                    )
+                };
+                // SAFETY: All SIDs are valid
+                let (is_user, is_system) =
+                    unsafe { (EqualSid(sid, user.sid()) != 0, EqualSid(sid, system.0) != 0) };
+
+                AceCheck {
+                    full_access_inherited: mask == FILE_ALL_ACCESS && header.AceFlags == inherit,
+                    is_user,
+                    is_system,
+                }
+            })
             .collect();
-        (owner.to_owned(), flags.to_owned(), aces)
+
+        DirSecurity {
+            owner_is_user,
+            dacl_protected: control & SE_DACL_PROTECTED != 0,
+            aces,
+        }
     }
 
     #[test]
     fn private_dir_is_owned_by_user_and_only_accessible_by_user_and_system() {
-        let sid = current_user_sid().unwrap();
         let parent = private_dir_parent().unwrap();
 
         let dir = create_private_dir(&parent).unwrap();
+        let security = dir_security(&dir);
         let sddl = owner_and_dacl_sddl(&dir);
         let removed = fs::remove_dir(&dir);
 
         assert!(dir.starts_with(&parent));
         assert!(is_private_dir_name(dir.file_name().unwrap()));
 
-        let sddl = sddl.unwrap();
-        let (owner, flags, aces) = parse_sddl(&sddl);
-        assert_eq!(owner, sid, "{sddl}");
-        assert!(flags.contains('P'), "DACL should be protected: {sddl}");
-        assert_eq!(
-            aces,
-            BTreeSet::from([
-                format!("(A;OICI;FA;;;{sid})"),
-                "(A;OICI;FA;;;SY)".to_owned()
-            ]),
-            "{sddl}"
-        );
+        let sddl = sddl.expect("SDDL should be readable");
+        assert!(security.owner_is_user, "{sddl}");
+        assert!(security.dacl_protected, "{sddl}");
+
+        // Every ACE grants full access to the user or SYSTEM. When running as SYSTEM, both
+        // may be the same ACE.
+        assert!(!security.aces.is_empty(), "{sddl}");
+        for ace in &security.aces {
+            assert!(ace.full_access_inherited, "{sddl}");
+            assert!(ace.is_user || ace.is_system, "{sddl}");
+        }
+        assert!(security.aces.iter().any(|ace| ace.is_user), "{sddl}");
+        assert!(security.aces.iter().any(|ace| ace.is_system), "{sddl}");
 
         removed.expect("private directory should be removable");
         assert!(!dir.exists());
@@ -534,6 +674,25 @@ mod tests {
                 let in_private_dir = is_private_dir_name(dir.file_name().unwrap());
                 assert!(in_temp_state || in_private_dir, "{path:?}");
             }
+        }
+    }
+
+    #[test]
+    fn app_socket_name_is_unchanged_without_package_identity() {
+        let socket_name = crate::app_socket_name();
+        let OwnedSocketName::Path(path) = &socket_name;
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        let parent = path.parent().map(Path::to_path_buf);
+        crate::socket_dir::remove_private_socket_dir(&socket_name);
+
+        if package_family_name().unwrap().is_none() {
+            assert_eq!(parent, Some(std::env::temp_dir()), "{path:?}");
+            let id = name.strip_prefix("temp-socket-").expect(&name);
+            assert_eq!(id.len(), 32, "{name}");
+            assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+        } else {
+            assert_ne!(parent, Some(std::env::temp_dir()), "{path:?}");
+            assert!(name.starts_with("s-"), "{name}");
         }
     }
 }

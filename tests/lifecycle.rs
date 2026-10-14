@@ -294,22 +294,86 @@ fn server_exits_when_no_client_connects() {
     assert!(!output.iter().any(|line| line == "APP_CODE_RAN"));
 }
 
+#[cfg(windows)]
 #[test]
 fn server_removes_private_socket_dir() {
-    let dir = TempDir::new("priv");
-    // A directory named like the private directories the app process creates on Windows
-    let private_dir = dir.0.join("mdc-0123abcd");
-    fs::create_dir(&private_dir).unwrap();
+    use minidumper_child::socket_dir::sys;
+
+    let private_dir = sys::create_private_dir(&sys::private_dir_parent().unwrap()).unwrap();
+    let parent = private_dir.parent().unwrap().to_path_buf();
 
     let (status, _, output) = run_unconnected_server_at(&private_dir.join("s"), 500, 2500);
+    let removed = !private_dir.exists();
+    let _ = fs::remove_dir(&private_dir);
 
     assert_eq!(status.code(), Some(0), "output: {output:?}");
-    assert!(
-        !private_dir.exists(),
-        "private socket directory was not removed"
-    );
+    assert!(removed, "private socket directory was not removed");
     // Only the private directory is removed
-    assert!(dir.0.is_dir());
+    assert!(parent.is_dir());
+}
+
+/// Outside of Windows, socket directories are never removed, even if they are named like the
+/// private directories created on Windows.
+#[cfg(not(windows))]
+#[test]
+fn server_keeps_socket_dir_named_like_private_dir() {
+    let dir = TempDir::new("srvkeep");
+    let socket_dir = dir.0.join("mdc-0123abcd");
+    fs::create_dir(&socket_dir).unwrap();
+
+    let (status, _, output) = run_unconnected_server_at(&socket_dir.join("s"), 500, 2500);
+
+    assert_eq!(status.code(), Some(0), "output: {output:?}");
+    assert!(socket_dir.is_dir(), "socket directory was removed");
+}
+
+/// Like [`server_keeps_socket_dir_named_like_private_dir`], for the app process cleaning up
+/// after a server it failed to connect to. The socket goes into `TMPDIR`.
+#[cfg(not(windows))]
+#[test]
+fn app_keeps_temp_dir_named_like_private_dir() {
+    let dir = TempDir::new("appkeep");
+    let temp_dir = dir.0.join("mdc-0123abcd");
+    fs::create_dir(&temp_dir).unwrap();
+    let report = dir.0.join("report");
+
+    let mut command = example();
+    command
+        .env("TMPDIR", &temp_dir)
+        .env("LIFECYCLE_CONNECT_TIMEOUT_MS", "4000")
+        .env("LIFECYCLE_STUB_REPORT", &report);
+
+    let mut running = Running::spawn(command);
+    let (status, _) = running.wait_for_exit(Duration::from_secs(120));
+    let stdout = running.output();
+
+    assert!(status.success(), "example failed: {stdout:?}");
+    assert!(
+        stdout
+            .iter()
+            .any(|line| line.starts_with("SPAWN_ERR CreateClient")),
+        "spawn() should fail to connect: {stdout:?}"
+    );
+
+    let report = fs::read_to_string(&report).expect("stub server should have written a report");
+    let socket_path = report.splitn(3, '\n').nth(2).expect("missing socket path");
+
+    // Linux and Android use abstract sockets, elsewhere the socket is in the directory
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        assert!(
+            Path::new(socket_path).starts_with(&temp_dir),
+            "{socket_path}"
+        );
+        assert!(
+            !Path::new(socket_path).exists(),
+            "{socket_path} was not removed"
+        );
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = socket_path;
+
+    assert!(temp_dir.is_dir(), "temporary directory was removed");
 }
 
 #[test]

@@ -71,7 +71,7 @@ pub fn fits(path: &Path) -> bool {
 /// with `file_name`, fits:
 ///
 /// 1. The `TempState` directory
-/// 2. Its short form, if it differs
+/// 2. Its short form
 /// 3. A new private directory
 ///
 /// If none of them fit, the system temporary directory is used.
@@ -88,7 +88,7 @@ pub fn choose_socket_dir(package: Option<&PackageDirs>, file_name: &str) -> Sock
         }
 
         if let Some(short) = &package.temp_state_short {
-            if short != long && dir_fits(short) {
+            if dir_fits(short) {
                 return SocketDir::Existing(short.clone());
             }
         }
@@ -139,21 +139,59 @@ pub fn private_dir_sddl(sid: &str) -> String {
     format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)")
 }
 
-/// Returns the directory of a socket if it is a private directory created for it.
-pub fn private_socket_dir(socket_name: &OwnedSocketName) -> Option<&Path> {
-    match socket_name {
-        OwnedSocketName::Path(path) => {
-            let dir = path.parent()?;
-            is_private_dir_name(dir.file_name()?).then_some(dir)
+/// Compares two paths component by component, ignoring case like Windows file systems do
+/// (approximately).
+fn paths_equal_ignoring_case(a: &Path, b: &Path) -> bool {
+    let mut a = a.components();
+    let mut b = b.components();
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(a), Some(b)) => {
+                let (Some(a), Some(b)) = (a.as_os_str().to_str(), b.as_os_str().to_str()) else {
+                    return false;
+                };
+                if a != b && a.to_lowercase() != b.to_lowercase() {
+                    return false;
+                }
+            }
+            _ => return false,
         }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        OwnedSocketName::Abstract(_) => None,
+    }
+}
+
+/// Returns whether `dir` is a private socket directory, i.e. it has a private directory
+/// name and lives directly in `private_dir_parent`.
+pub fn is_private_socket_dir(dir: &Path, private_dir_parent: &Path) -> bool {
+    let (Some(name), Some(parent)) = (dir.file_name(), dir.parent()) else {
+        return false;
+    };
+    is_private_dir_name(name) && paths_equal_ignoring_case(parent, private_dir_parent)
+}
+
+/// Returns the directory of a socket if it is a private directory created for it.
+///
+/// Private directories are only created on Windows, so this is always `None` elsewhere.
+pub fn private_socket_dir(socket_name: &OwnedSocketName) -> Option<&Path> {
+    #[cfg(windows)]
+    {
+        let OwnedSocketName::Path(path) = socket_name;
+        let dir = path.parent()?;
+        let private_dir_parent = sys::private_dir_parent().ok()?;
+        is_private_socket_dir(dir, &private_dir_parent).then_some(dir)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = socket_name;
+        None
     }
 }
 
 /// Removes the directory of a socket if it is an empty private directory created for it.
 ///
-/// This is best effort and only ever removes an empty directory.
+/// This is best effort and only ever removes an empty directory. It does nothing outside of
+/// Windows.
 pub fn remove_private_socket_dir(socket_name: &OwnedSocketName) {
     if let Some(dir) = private_socket_dir(socket_name) {
         let _ = fs::remove_dir(dir);
@@ -211,17 +249,6 @@ mod tests {
     #[test]
     fn packaged_uses_private_dir_when_temp_state_does_not_fit() {
         let package = package(Some(150), Some(120), Some(40));
-        assert_eq!(
-            choose_socket_dir(Some(&package), FILE_NAME),
-            SocketDir::CreatePrivate(package.private_dir.clone().unwrap())
-        );
-    }
-
-    #[test]
-    fn packaged_skips_short_temp_state_equal_to_long() {
-        // Without 8.3 names the short form is the same as the long form
-        let mut package = package(Some(150), None, Some(40));
-        package.temp_state_short = package.temp_state_long.clone();
         assert_eq!(
             choose_socket_dir(Some(&package), FILE_NAME),
             SocketDir::CreatePrivate(package.private_dir.clone().unwrap())
@@ -347,38 +374,84 @@ mod tests {
     }
 
     #[test]
-    fn private_socket_dir_only_matches_private_dirs() {
-        let private = std::env::temp_dir().join("mdc-0123abcd");
-        let socket_name = OwnedSocketName::Path(private.join("s-0123abcd"));
-        assert_eq!(private_socket_dir(&socket_name), Some(private.as_path()));
+    fn private_socket_dir_requires_private_name_and_parent() {
+        let parent = Path::new("/Windows/Temp");
 
-        let socket_name = OwnedSocketName::Path(std::env::temp_dir().join("temp-socket-0"));
-        assert_eq!(private_socket_dir(&socket_name), None);
+        assert!(is_private_socket_dir(&parent.join("mdc-0123abcd"), parent));
+        // Windows paths are case insensitive
+        assert!(is_private_socket_dir(
+            Path::new("/WINDOWS/temp/mdc-0123abcd"),
+            parent
+        ));
+
+        // Wrong name
+        assert!(!is_private_socket_dir(&parent.join("mdc-0123"), parent));
+        assert!(!is_private_socket_dir(&parent.join("temp-socket"), parent));
+        // Wrong parent
+        assert!(!is_private_socket_dir(
+            Path::new("/tmp/mdc-0123abcd"),
+            parent
+        ));
+        assert!(!is_private_socket_dir(
+            Path::new("/Windows/Temp/x/mdc-0123abcd"),
+            parent
+        ));
+        assert!(!is_private_socket_dir(
+            Path::new("/Windows/mdc-0123abcd"),
+            parent
+        ));
+        assert!(!is_private_socket_dir(Path::new("mdc-0123abcd"), parent));
     }
 
+    /// Outside of Windows nothing is ever removed, even if it is named like a private
+    /// directory, so behaviour is the same as before private directories existed.
+    #[cfg(not(windows))]
+    #[test]
+    fn private_socket_dirs_are_never_removed_outside_windows() {
+        let base = std::env::temp_dir().join(format!("mdct-keep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dir = base.join(private_dir_name(uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let socket_name = OwnedSocketName::Path(dir.join("s"));
+        let found = private_socket_dir(&socket_name);
+        remove_private_socket_dir(&socket_name);
+        let kept = dir.is_dir();
+        fs::remove_dir_all(&base).unwrap();
+
+        assert_eq!(found, None);
+        assert!(kept, "{dir:?} was removed");
+    }
+
+    #[cfg(windows)]
     #[test]
     fn remove_private_socket_dir_only_removes_empty_private_dirs() {
+        let parent = sys::private_dir_parent().unwrap();
+        let private = sys::create_private_dir(&parent).unwrap();
+
+        // Named like a private directory, but not in the private directory parent
         let base = std::env::temp_dir().join(format!("mdct-rm-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
+        let elsewhere = base.join(private_dir_name(uuid::Uuid::new_v4()));
+        fs::create_dir_all(&elsewhere).unwrap();
 
-        let private = base.join(private_dir_name(uuid::Uuid::new_v4()));
-        let other = base.join("other");
-        fs::create_dir_all(&private).unwrap();
-        fs::create_dir_all(&other).unwrap();
-
-        // Not a private directory
-        remove_private_socket_dir(&OwnedSocketName::Path(other.join("s")));
-        assert!(other.is_dir());
+        remove_private_socket_dir(&OwnedSocketName::Path(elsewhere.join("s")));
+        let elsewhere_kept = elsewhere.is_dir();
 
         // Not empty
         fs::write(private.join("keep"), b"").unwrap();
         remove_private_socket_dir(&OwnedSocketName::Path(private.join("s")));
-        assert!(private.is_dir());
+        let non_empty_kept = private.is_dir();
 
         fs::remove_file(private.join("keep")).unwrap();
         remove_private_socket_dir(&OwnedSocketName::Path(private.join("s")));
-        assert!(!private.exists());
+        let removed = !private.exists();
 
-        fs::remove_dir_all(&base).unwrap();
+        let _ = fs::remove_dir(&private);
+        let _ = fs::remove_dir_all(&base);
+
+        assert!(elsewhere_kept);
+        assert!(non_empty_kept);
+        assert!(removed);
     }
 }

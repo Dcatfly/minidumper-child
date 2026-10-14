@@ -7,17 +7,11 @@
 //! the system temporary directory.
 //!
 //! The decision is made by [`choose_socket_dir`], which only works on facts gathered
-//! beforehand so it can be tested on every platform. The system calls live in [`sys`].
+//! beforehand so it can be tested on every platform. The system calls live in `sys`.
 //!
 //! This module is not part of the public API.
 
-use std::{
-    ffi::OsStr,
-    fs,
-    path::{Path, PathBuf},
-};
-
-use crate::OwnedSocketName;
+use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 pub mod sys;
@@ -27,10 +21,7 @@ pub mod sys;
 /// `sun_path` is 108 bytes and `minidumper` rejects paths that don't leave room for the NUL.
 pub const MAX_SOCKET_PATH_LEN: usize = 107;
 
-/// The prefix of the private directories created for sockets.
-pub const PRIVATE_DIR_PREFIX: &str = "mdc-";
-
-/// The number of hex digits used in short socket file and directory names.
+/// The number of hex digits in the socket file name of packaged processes.
 const SHORT_ID_LEN: usize = 8;
 
 /// The facts about a packaged process needed to choose the socket directory.
@@ -40,8 +31,6 @@ pub struct PackageDirs {
     pub temp_state_long: Option<PathBuf>,
     /// The 8.3 short form of `temp_state_long`, if available
     pub temp_state_short: Option<PathBuf>,
-    /// The path of a private directory that could be created for the socket
-    pub private_dir: Option<PathBuf>,
 }
 
 /// Where to put the socket file.
@@ -49,8 +38,6 @@ pub struct PackageDirs {
 pub enum SocketDir {
     /// An existing directory
     Existing(PathBuf),
-    /// A private directory that has to be created first
-    CreatePrivate(PathBuf),
     /// The system temporary directory, with the original socket file name
     SystemTemp,
 }
@@ -72,9 +59,8 @@ pub fn fits(path: &Path) -> bool {
 ///
 /// 1. The `TempState` directory
 /// 2. Its short form
-/// 3. A new private directory
 ///
-/// If none of them fit, the system temporary directory is used.
+/// If neither fits, the system temporary directory is used.
 pub fn choose_socket_dir(package: Option<&PackageDirs>, file_name: &str) -> SocketDir {
     let Some(package) = package else {
         return SocketDir::SystemTemp;
@@ -94,108 +80,16 @@ pub fn choose_socket_dir(package: Option<&PackageDirs>, file_name: &str) -> Sock
         }
     }
 
-    match &package.private_dir {
-        Some(private_dir) if dir_fits(private_dir) => SocketDir::CreatePrivate(private_dir.clone()),
-        _ => SocketDir::SystemTemp,
-    }
-}
-
-fn short_id(id: uuid::Uuid) -> String {
-    let mut id = id.simple().to_string();
-    id.truncate(SHORT_ID_LEN);
-    id
+    SocketDir::SystemTemp
 }
 
 /// Returns the socket file name used by packaged processes.
 ///
 /// This is shorter than the original name so that it fits into `TempState`.
 pub fn packaged_socket_file_name(id: uuid::Uuid) -> String {
-    format!("s-{}", short_id(id))
-}
-
-/// Returns the name for a private socket directory.
-pub fn private_dir_name(id: uuid::Uuid) -> String {
-    format!("{PRIVATE_DIR_PREFIX}{}", short_id(id))
-}
-
-/// Returns whether `name` is the name of a private socket directory.
-pub fn is_private_dir_name(name: &OsStr) -> bool {
-    name.to_str()
-        .and_then(|name| name.strip_prefix(PRIVATE_DIR_PREFIX))
-        .is_some_and(|id| {
-            id.len() == SHORT_ID_LEN
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
-}
-
-/// Returns the SDDL for a private socket directory owned by `sid`.
-///
-/// Only the owner and `SYSTEM` get access, and nothing is inherited from the parent. The
-/// owner is set explicitly because directories created with an elevated administrator
-/// token are owned by `BUILTIN\Administrators` by default.
-pub fn private_dir_sddl(sid: &str) -> String {
-    format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)")
-}
-
-/// Compares two paths component by component, ignoring case like Windows file systems do
-/// (approximately).
-fn paths_equal_ignoring_case(a: &Path, b: &Path) -> bool {
-    let mut a = a.components();
-    let mut b = b.components();
-    loop {
-        match (a.next(), b.next()) {
-            (None, None) => return true,
-            (Some(a), Some(b)) => {
-                let (Some(a), Some(b)) = (a.as_os_str().to_str(), b.as_os_str().to_str()) else {
-                    return false;
-                };
-                if a != b && a.to_lowercase() != b.to_lowercase() {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
-}
-
-/// Returns whether `dir` is a private socket directory, i.e. it has a private directory
-/// name and lives directly in `private_dir_parent`.
-pub fn is_private_socket_dir(dir: &Path, private_dir_parent: &Path) -> bool {
-    let (Some(name), Some(parent)) = (dir.file_name(), dir.parent()) else {
-        return false;
-    };
-    is_private_dir_name(name) && paths_equal_ignoring_case(parent, private_dir_parent)
-}
-
-/// Returns the directory of a socket if it is a private directory created for it.
-///
-/// Private directories are only created on Windows, so this is always `None` elsewhere.
-pub fn private_socket_dir(socket_name: &OwnedSocketName) -> Option<&Path> {
-    #[cfg(windows)]
-    {
-        let OwnedSocketName::Path(path) = socket_name;
-        let dir = path.parent()?;
-        let private_dir_parent = sys::private_dir_parent().ok()?;
-        is_private_socket_dir(dir, &private_dir_parent).then_some(dir)
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = socket_name;
-        None
-    }
-}
-
-/// Removes the directory of a socket if it is an empty private directory created for it.
-///
-/// This is best effort and only ever removes an empty directory. It does nothing outside of
-/// Windows.
-pub fn remove_private_socket_dir(socket_name: &OwnedSocketName) {
-    if let Some(dir) = private_socket_dir(socket_name) {
-        let _ = fs::remove_dir(dir);
-    }
+    let mut id = id.simple().to_string();
+    id.truncate(SHORT_ID_LEN);
+    format!("s-{id}")
 }
 
 #[cfg(test)]
@@ -215,11 +109,10 @@ mod tests {
         PathBuf::from(dir)
     }
 
-    fn package(long: Option<usize>, short: Option<usize>, private: Option<usize>) -> PackageDirs {
+    fn package(long: Option<usize>, short: Option<usize>) -> PackageDirs {
         PackageDirs {
             temp_state_long: long.map(dir_for_socket_len),
             temp_state_short: short.map(dir_for_socket_len),
-            private_dir: private.map(dir_for_socket_len),
         }
     }
 
@@ -230,7 +123,7 @@ mod tests {
 
     #[test]
     fn packaged_uses_temp_state_when_it_fits() {
-        let package = package(Some(60), Some(40), Some(30));
+        let package = package(Some(60), Some(40));
         assert_eq!(
             choose_socket_dir(Some(&package), FILE_NAME),
             SocketDir::Existing(package.temp_state_long.clone().unwrap())
@@ -239,7 +132,7 @@ mod tests {
 
     #[test]
     fn packaged_uses_short_temp_state_when_long_does_not_fit() {
-        let package = package(Some(110), Some(60), Some(30));
+        let package = package(Some(110), Some(60));
         assert_eq!(
             choose_socket_dir(Some(&package), FILE_NAME),
             SocketDir::Existing(package.temp_state_short.clone().unwrap())
@@ -247,26 +140,18 @@ mod tests {
     }
 
     #[test]
-    fn packaged_uses_private_dir_when_temp_state_does_not_fit() {
-        let package = package(Some(150), Some(120), Some(40));
+    fn packaged_uses_system_temp_when_neither_fits() {
+        let package = package(Some(150), Some(120));
         assert_eq!(
             choose_socket_dir(Some(&package), FILE_NAME),
-            SocketDir::CreatePrivate(package.private_dir.clone().unwrap())
+            SocketDir::SystemTemp
         );
-    }
 
-    #[test]
-    fn packaged_uses_private_dir_without_temp_state() {
-        let package = package(None, None, Some(40));
-        assert_eq!(
-            choose_socket_dir(Some(&package), FILE_NAME),
-            SocketDir::CreatePrivate(package.private_dir.clone().unwrap())
-        );
-    }
-
-    #[test]
-    fn packaged_uses_system_temp_when_nothing_fits() {
-        let package = package(Some(150), Some(120), Some(110));
+        // Without a short form
+        let package = PackageDirs {
+            temp_state_short: None,
+            ..package
+        };
         assert_eq!(
             choose_socket_dir(Some(&package), FILE_NAME),
             SocketDir::SystemTemp
@@ -274,12 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn packaged_uses_system_temp_without_any_candidate() {
-        let package = package(Some(150), Some(120), None);
-        assert_eq!(
-            choose_socket_dir(Some(&package), FILE_NAME),
-            SocketDir::SystemTemp
-        );
+    fn packaged_uses_system_temp_without_temp_state() {
         assert_eq!(
             choose_socket_dir(Some(&PackageDirs::default()), FILE_NAME),
             SocketDir::SystemTemp
@@ -291,43 +171,43 @@ mod tests {
         assert!(fits(&dir_for_socket_len(107).join(FILE_NAME)));
         assert!(!fits(&dir_for_socket_len(108).join(FILE_NAME)));
 
-        let at_limit = PackageDirs {
-            temp_state_long: Some(dir_for_socket_len(107)),
-            ..PackageDirs::default()
-        };
+        let long_at_limit = package(Some(107), None);
         assert_eq!(
-            choose_socket_dir(Some(&at_limit), FILE_NAME),
+            choose_socket_dir(Some(&long_at_limit), FILE_NAME),
             SocketDir::Existing(dir_for_socket_len(107))
         );
 
-        let over_limit = PackageDirs {
-            temp_state_long: Some(dir_for_socket_len(108)),
-            temp_state_short: Some(dir_for_socket_len(107)),
-            ..PackageDirs::default()
-        };
+        let short_at_limit = package(Some(108), Some(107));
         assert_eq!(
-            choose_socket_dir(Some(&over_limit), FILE_NAME),
+            choose_socket_dir(Some(&short_at_limit), FILE_NAME),
             SocketDir::Existing(dir_for_socket_len(107))
         );
 
-        let private_over_limit = PackageDirs {
-            private_dir: Some(dir_for_socket_len(108)),
-            ..PackageDirs::default()
-        };
+        let both_over_limit = package(Some(108), Some(108));
         assert_eq!(
-            choose_socket_dir(Some(&private_over_limit), FILE_NAME),
+            choose_socket_dir(Some(&both_over_limit), FILE_NAME),
             SocketDir::SystemTemp
         );
     }
 
     #[test]
     fn length_counts_utf8_bytes() {
-        // 30 characters, but 90 bytes
-        let dir = PathBuf::from(format!("/{}", "\u{4e2d}".repeat(30)));
-        assert!(fits(&dir.join(FILE_NAME)));
+        // 30 characters, but 90 bytes, so the socket path is 102 bytes
+        let fitting = PathBuf::from(format!("/{}", "\u{4e2d}".repeat(30)));
+        // 32 characters, 96 bytes, so the socket path is 108 bytes
+        let too_long = PathBuf::from(format!("/{}", "\u{4e2d}".repeat(32)));
 
-        let dir = PathBuf::from(format!("/{}", "\u{4e2d}".repeat(32)));
-        assert!(!fits(&dir.join(FILE_NAME)));
+        assert!(fits(&fitting.join(FILE_NAME)));
+        assert!(!fits(&too_long.join(FILE_NAME)));
+
+        let package = PackageDirs {
+            temp_state_long: Some(too_long),
+            temp_state_short: Some(fitting.clone()),
+        };
+        assert_eq!(
+            choose_socket_dir(Some(&package), FILE_NAME),
+            SocketDir::Existing(fitting)
+        );
     }
 
     #[cfg(unix)]
@@ -335,8 +215,17 @@ mod tests {
     fn non_utf8_path_does_not_fit() {
         use std::os::unix::ffi::OsStrExt;
 
-        let path = Path::new(std::ffi::OsStr::from_bytes(&[b'/', 0x80, b'x']));
-        assert!(!fits(path));
+        let non_utf8 = PathBuf::from(std::ffi::OsStr::from_bytes(&[b'/', 0x80, b'x']));
+        assert!(!fits(&non_utf8.join(FILE_NAME)));
+
+        let package = PackageDirs {
+            temp_state_long: Some(non_utf8),
+            temp_state_short: None,
+        };
+        assert_eq!(
+            choose_socket_dir(Some(&package), FILE_NAME),
+            SocketDir::SystemTemp
+        );
     }
 
     #[test]
@@ -345,113 +234,5 @@ mod tests {
         let id = name.strip_prefix("s-").expect("should start with s-");
         assert_eq!(id.len(), 8);
         assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn private_dir_names_are_recognised() {
-        let name = private_dir_name(uuid::Uuid::new_v4());
-        assert!(is_private_dir_name(name.as_ref()));
-
-        for name in [
-            "mdc-0123abc",
-            "mdc-0123abcde",
-            "mdc-0123ABCD",
-            "mdc-0123abcg",
-            "mdct-conn-1",
-            "xmdc-0123abcd",
-            "temp-socket-0123abcd",
-        ] {
-            assert!(!is_private_dir_name(name.as_ref()), "{name}");
-        }
-    }
-
-    #[test]
-    fn private_dir_sddl_grants_owner_and_system_only() {
-        assert_eq!(
-            private_dir_sddl("S-1-5-21-1-2-3-1001"),
-            "O:S-1-5-21-1-2-3-1001D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;OICI;FA;;;SY)"
-        );
-    }
-
-    #[test]
-    fn private_socket_dir_requires_private_name_and_parent() {
-        let parent = Path::new("/Windows/Temp");
-
-        assert!(is_private_socket_dir(&parent.join("mdc-0123abcd"), parent));
-        // Windows paths are case insensitive
-        assert!(is_private_socket_dir(
-            Path::new("/WINDOWS/temp/mdc-0123abcd"),
-            parent
-        ));
-
-        // Wrong name
-        assert!(!is_private_socket_dir(&parent.join("mdc-0123"), parent));
-        assert!(!is_private_socket_dir(&parent.join("temp-socket"), parent));
-        // Wrong parent
-        assert!(!is_private_socket_dir(
-            Path::new("/tmp/mdc-0123abcd"),
-            parent
-        ));
-        assert!(!is_private_socket_dir(
-            Path::new("/Windows/Temp/x/mdc-0123abcd"),
-            parent
-        ));
-        assert!(!is_private_socket_dir(
-            Path::new("/Windows/mdc-0123abcd"),
-            parent
-        ));
-        assert!(!is_private_socket_dir(Path::new("mdc-0123abcd"), parent));
-    }
-
-    /// Outside of Windows nothing is ever removed, even if it is named like a private
-    /// directory, so behaviour is the same as before private directories existed.
-    #[cfg(not(windows))]
-    #[test]
-    fn private_socket_dirs_are_never_removed_outside_windows() {
-        let base = std::env::temp_dir().join(format!("mdct-keep-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        let dir = base.join(private_dir_name(uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-
-        let socket_name = OwnedSocketName::Path(dir.join("s"));
-        let found = private_socket_dir(&socket_name);
-        remove_private_socket_dir(&socket_name);
-        let kept = dir.is_dir();
-        fs::remove_dir_all(&base).unwrap();
-
-        assert_eq!(found, None);
-        assert!(kept, "{dir:?} was removed");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn remove_private_socket_dir_only_removes_empty_private_dirs() {
-        let parent = sys::private_dir_parent().unwrap();
-        let private = sys::create_private_dir(&parent).unwrap();
-
-        // Named like a private directory, but not in the private directory parent
-        let base = std::env::temp_dir().join(format!("mdct-rm-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        let elsewhere = base.join(private_dir_name(uuid::Uuid::new_v4()));
-        fs::create_dir_all(&elsewhere).unwrap();
-
-        remove_private_socket_dir(&OwnedSocketName::Path(elsewhere.join("s")));
-        let elsewhere_kept = elsewhere.is_dir();
-
-        // Not empty
-        fs::write(private.join("keep"), b"").unwrap();
-        remove_private_socket_dir(&OwnedSocketName::Path(private.join("s")));
-        let non_empty_kept = private.is_dir();
-
-        fs::remove_file(private.join("keep")).unwrap();
-        remove_private_socket_dir(&OwnedSocketName::Path(private.join("s")));
-        let removed = !private.exists();
-
-        let _ = fs::remove_dir(&private);
-        let _ = fs::remove_dir_all(&base);
-
-        assert!(elsewhere_kept);
-        assert!(non_empty_kept);
-        assert!(removed);
     }
 }

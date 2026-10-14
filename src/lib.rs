@@ -196,11 +196,9 @@ impl MinidumperChild {
             // Panics, e.g. from the `on_minidump` or `on_message` callbacks, are caught so
             // they don't unwind into the caller either. The panic hook still runs first,
             // and this has no effect when built with `panic = "abort"`.
-            let mut parsed_socket_name = None;
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let socket_name = OwnedSocketName::from_os_str(&socket_name)
                     .ok_or_else(|| Error::InvalidSocketName(socket_name.clone()))?;
-                parsed_socket_name = Some(socket_name.clone());
 
                 let connect_grace =
                     server_connect_grace(self.client_connect_timeout, self.server_connect_timeout);
@@ -214,12 +212,6 @@ impl MinidumperChild {
                     self.on_message,
                 )
             }));
-
-            // The server removed its socket file when it was dropped, now remove the
-            // private directory the app process may have created for it
-            if let Some(socket_name) = &parsed_socket_name {
-                socket_dir::remove_private_socket_dir(socket_name);
-            }
 
             let code = match result {
                 Ok(Ok(())) => 0,
@@ -236,24 +228,17 @@ impl MinidumperChild {
             // processes between different instances of the app.
             let socket_name = app_socket_name();
 
-            let server_process = std::env::current_exe().and_then(|current_exe| {
-                let mut process = process::Command::new(current_exe);
-                if let Some(on_process) = self.on_process {
-                    on_process(&mut process);
-                }
-                // Always set this last, so an accidental `env_clear()` doesn't remove it.
-                process.env(self.server_env, socket_name.as_os_string());
-                process.spawn()
-            });
-
-            let mut server_process = match server_process {
-                Ok(server_process) => server_process,
-                Err(err) => {
-                    // The socket directory may have been created for this server
-                    socket_dir::remove_private_socket_dir(&socket_name);
-                    return Err(Error::SpawnProcess(err));
-                }
-            };
+            let mut server_process = std::env::current_exe()
+                .and_then(|current_exe| {
+                    let mut process = process::Command::new(current_exe);
+                    if let Some(on_process) = self.on_process {
+                        on_process(&mut process);
+                    }
+                    // Always set this last, so an accidental `env_clear()` doesn't remove it.
+                    process.env(self.server_env, socket_name.as_os_string());
+                    process.spawn()
+                })
+                .map_err(Error::SpawnProcess)?;
 
             match client::start(
                 socket_name.clone(),
@@ -293,8 +278,7 @@ fn write_error(err: &dyn std::error::Error) {
     let _ = writeln!(std::io::stderr(), "{message}");
 }
 
-/// Kills the server process, waits for it to exit and removes its socket file, and its
-/// private directory if it has one.
+/// Kills the server process, waits for it to exit and removes its socket file.
 ///
 /// This is best effort: errors are ignored because the caller is already returning an error.
 fn terminate_server(server_process: &mut process::Child, socket_name: &OwnedSocketName) {
@@ -309,8 +293,6 @@ fn terminate_server(server_process: &mut process::Child, socket_name: &OwnedSock
         #[cfg(any(target_os = "linux", target_os = "android"))]
         OwnedSocketName::Abstract(_) => {}
     }
-
-    socket_dir::remove_private_socket_dir(socket_name);
 }
 
 /// Returns a new socket name for the app process to pass to the server process.
@@ -446,8 +428,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        app_socket_name, server_connect_grace, socket_dir, OwnedSocketName,
-        MIN_SERVER_CONNECT_MARGIN,
+        app_socket_name, server_connect_grace, OwnedSocketName, MIN_SERVER_CONNECT_MARGIN,
     };
 
     #[test]
@@ -599,7 +580,6 @@ mod tests {
 
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         let server_result = server_thread.join().expect("server thread panicked");
-        socket_dir::remove_private_socket_dir(&socket_name);
 
         assert_eq!(
             connected,

@@ -8,43 +8,87 @@ use std::{
     ptr,
 };
 
-use windows_sys::{
-    core::{GUID, PWSTR},
-    Win32::{
-        Foundation::{
-            CloseHandle, LocalFree, APPMODEL_ERROR_NO_PACKAGE, ERROR_ALREADY_EXISTS,
-            ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
-        },
-        Security::{
-            Authorization::{
-                ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-                SDDL_REVISION_1, SE_FILE_OBJECT,
-            },
-            GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-            PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-        },
-        Storage::{
-            FileSystem::{CreateDirectoryW, GetShortPathNameW},
-            Packaging::Appx::GetCurrentPackageFamilyName,
-        },
-        System::{
-            Com::CoTaskMemFree,
-            SystemInformation::GetSystemWindowsDirectoryW,
-            Threading::{GetCurrentProcess, OpenProcessToken},
-        },
-        UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
-    },
-};
-
-use super::{
-    choose_socket_dir, fits, packaged_socket_file_name, private_dir_name, private_dir_sddl,
-    PackageDirs, SocketDir,
-};
+use super::{choose_socket_dir, packaged_socket_file_name, PackageDirs, SocketDir};
 use crate::OwnedSocketName;
 
-/// How many random names to try when creating a private directory.
-const PRIVATE_DIR_ATTEMPTS: usize = 8;
+/// Hand written bindings, so no extra dependency is needed for four functions.
+///
+/// The signatures follow the Microsoft Learn documentation of each function and match the
+/// declarations in `windows-sys` 0.61.
+mod bindings {
+    use std::ffi::c_void;
+
+    /// `GUID` from `guiddef.h`
+    #[repr(C)]
+    pub struct Guid {
+        pub data1: u32,
+        pub data2: u16,
+        pub data3: u16,
+        pub data4: [u8; 8],
+    }
+
+    /// `FOLDERID_LocalAppData` from `KnownFolders.h`,
+    /// `{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}`
+    pub const FOLDERID_LOCAL_APP_DATA: Guid = Guid {
+        data1: 0xf1b32785,
+        data2: 0x6fba,
+        data3: 0x4fcf,
+        data4: [0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91],
+    };
+
+    /// `KF_FLAG_DEFAULT` from `ShlObj_core.h`
+    pub const KF_FLAG_DEFAULT: u32 = 0;
+    /// `ERROR_INSUFFICIENT_BUFFER` from `winerror.h`
+    pub const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+    /// `APPMODEL_ERROR_NO_PACKAGE` from `winerror.h`
+    pub const APPMODEL_ERROR_NO_PACKAGE: i32 = 15700;
+    /// `ERROR_SUCCESS` from `winerror.h`
+    pub const ERROR_SUCCESS: i32 = 0;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// `LONG GetCurrentPackageFamilyName(UINT32 *packageFamilyNameLength,
+        /// PWSTR packageFamilyName)` from `appmodel.h`.
+        ///
+        /// `windows-sys` declares the return type as `WIN32_ERROR` (`u32`), which has the
+        /// same ABI as `LONG`.
+        pub fn GetCurrentPackageFamilyName(
+            package_family_name_length: *mut u32,
+            package_family_name: *mut u16,
+        ) -> i32;
+
+        /// `DWORD GetShortPathNameW(LPCWSTR lpszLongPath, LPWSTR lpszShortPath,
+        /// DWORD cchBuffer)` from `fileapi.h`
+        pub fn GetShortPathNameW(
+            long_path: *const u16,
+            short_path: *mut u16,
+            buffer_len: u32,
+        ) -> u32;
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        /// `HRESULT SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags,
+        /// HANDLE hToken, PWSTR *ppszPath)` from `ShlObj_core.h`
+        pub fn SHGetKnownFolderPath(
+            rfid: *const Guid,
+            flags: u32,
+            token: *mut c_void,
+            path: *mut *mut u16,
+        ) -> i32;
+    }
+
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        /// `void CoTaskMemFree(LPVOID pv)` from `combaseapi.h`, in `Ole32.lib`.
+        ///
+        /// `windows-sys` links it from `combase.dll`, which `ole32.dll` forwards it to, and
+        /// declares the pointer as `*const`, which has the same ABI.
+        pub fn CoTaskMemFree(pv: *mut c_void);
+    }
+}
+
+use bindings::*;
 
 /// Returns `path` as a NUL terminated wide string.
 fn to_wide(path: &Path) -> Vec<u16> {
@@ -64,28 +108,6 @@ unsafe fn from_wide_ptr(ptr: *const u16) -> OsString {
     OsString::from_wide(std::slice::from_raw_parts(ptr, len))
 }
 
-/// Frees memory allocated with `LocalAlloc` when dropped.
-struct LocalMem(*mut c_void);
-
-impl Drop for LocalMem {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: The pointer was allocated by the system with `LocalAlloc`
-            unsafe { LocalFree(self.0) };
-        }
-    }
-}
-
-/// Closes a handle when dropped.
-struct OwnedHandle(HANDLE);
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        // SAFETY: The handle is valid and owned by us
-        unsafe { CloseHandle(self.0) };
-    }
-}
-
 /// Returns the package family name, or `None` if the process has no package identity.
 pub fn package_family_name() -> io::Result<Option<String>> {
     let mut len = 0u32;
@@ -94,14 +116,14 @@ pub fn package_family_name() -> io::Result<Option<String>> {
     match rc {
         APPMODEL_ERROR_NO_PACKAGE => return Ok(None),
         ERROR_INSUFFICIENT_BUFFER => {}
-        rc => return Err(io::Error::from_raw_os_error(rc as i32)),
+        rc => return Err(io::Error::from_raw_os_error(rc)),
     }
 
     let mut buf = vec![0u16; len as usize];
     // SAFETY: The buffer holds `len` wide characters
     let rc = unsafe { GetCurrentPackageFamilyName(&mut len, buf.as_mut_ptr()) };
     if rc != ERROR_SUCCESS {
-        return Err(io::Error::from_raw_os_error(rc as i32));
+        return Err(io::Error::from_raw_os_error(rc));
     }
 
     // `len` includes the terminating NUL
@@ -111,11 +133,18 @@ pub fn package_family_name() -> io::Result<Option<String>> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid package family name"))
 }
 
-fn known_folder(id: &GUID) -> io::Result<PathBuf> {
-    let mut path: PWSTR = ptr::null_mut();
+/// Returns the user's local application data directory, e.g. `C:\Users\me\AppData\Local`.
+pub fn local_app_data_dir() -> io::Result<PathBuf> {
+    let mut path: *mut u16 = ptr::null_mut();
     // SAFETY: `path` receives a string that has to be freed with `CoTaskMemFree`
-    let hr =
-        unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT as u32, ptr::null_mut(), &mut path) };
+    let hr = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_LOCAL_APP_DATA,
+            KF_FLAG_DEFAULT,
+            ptr::null_mut(),
+            &mut path,
+        )
+    };
 
     let result = if hr >= 0 && !path.is_null() {
         // SAFETY: On success `path` is a NUL terminated wide string
@@ -127,14 +156,9 @@ fn known_folder(id: &GUID) -> io::Result<PathBuf> {
     };
 
     // SAFETY: The string must be freed even if the call failed, freeing null is a no-op
-    unsafe { CoTaskMemFree(path as *const c_void) };
+    unsafe { CoTaskMemFree(path.cast::<c_void>()) };
 
     result
-}
-
-/// Returns the user's local application data directory, e.g. `C:\Users\me\AppData\Local`.
-pub fn local_app_data_dir() -> io::Result<PathBuf> {
-    known_folder(&FOLDERID_LocalAppData)
 }
 
 /// Returns the `TempState` directory of the package with the given family name.
@@ -180,213 +204,6 @@ pub fn short_path_name(path: &Path) -> io::Result<PathBuf> {
     Err(io::Error::other("GetShortPathNameW kept growing"))
 }
 
-/// Returns the shared Windows directory, e.g. `C:\Windows`.
-///
-/// Unlike `GetWindowsDirectoryW` this is never a per-user directory on terminal servers.
-pub fn windows_dir() -> io::Result<PathBuf> {
-    let mut len = 260u32;
-
-    for _ in 0..4 {
-        let mut buf = vec![0u16; len as usize];
-        // SAFETY: The buffer holds `len` wide characters
-        let written = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), len) };
-        if written == 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // On success the length excludes the NUL, otherwise it's the required length
-        if written < len {
-            buf.truncate(written as usize);
-            return Ok(PathBuf::from(OsString::from_wide(&buf)));
-        }
-        len = written;
-    }
-
-    Err(io::Error::other("GetSystemWindowsDirectoryW kept growing"))
-}
-
-/// The `TOKEN_USER` of the current process, in a buffer aligned for it.
-pub(crate) struct CurrentTokenUser(Vec<u64>);
-
-impl CurrentTokenUser {
-    pub(crate) fn get() -> io::Result<Self> {
-        let mut token: HANDLE = ptr::null_mut();
-        // SAFETY: `GetCurrentProcess` returns a pseudo handle that doesn't need closing
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let token = OwnedHandle(token);
-
-        let mut len = 0u32;
-        // SAFETY: A zero length with a null buffer queries the required length
-        unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut len) };
-        if len == 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Use `u64` so the buffer is aligned for `TOKEN_USER`
-        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
-        // SAFETY: The buffer holds at least `len` bytes
-        if unsafe {
-            GetTokenInformation(token.0, TokenUser, buf.as_mut_ptr().cast(), len, &mut len)
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(Self(buf))
-    }
-
-    /// Returns the user's SID, which points into this buffer.
-    pub(crate) fn sid(&self) -> PSID {
-        // SAFETY: The buffer was filled with a `TOKEN_USER` by `GetTokenInformation`
-        unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
-    }
-}
-
-/// Returns the SID of the user the process runs as, e.g. `S-1-5-21-…-1001`.
-pub fn current_user_sid() -> io::Result<String> {
-    let token_user = CurrentTokenUser::get()?;
-
-    let mut sid_string: PWSTR = ptr::null_mut();
-    // SAFETY: The SID points into `token_user` which is still alive
-    if unsafe { ConvertSidToStringSidW(token_user.sid(), &mut sid_string) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let sid_string = LocalMem(sid_string.cast());
-
-    // SAFETY: On success this is a NUL terminated wide string
-    let sid = unsafe { from_wide_ptr(sid_string.0.cast()) };
-    sid.into_string()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid SID"))
-}
-
-/// Creates a directory with the security descriptor given as SDDL.
-///
-/// Fails with `ERROR_ALREADY_EXISTS` if the path already exists.
-pub fn create_dir_with_sddl(path: &Path, sddl: &str) -> io::Result<()> {
-    let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
-
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: `descriptor` receives memory that has to be freed with `LocalFree`
-    if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.as_ptr(),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            ptr::null_mut(),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let descriptor = LocalMem(descriptor);
-
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor.0,
-        bInheritHandle: 0,
-    };
-
-    let wide = to_wide(path);
-    // SAFETY: Both pointers are valid for the duration of the call
-    if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(())
-}
-
-/// Returns the owner and DACL of a file or directory as SDDL.
-pub fn owner_and_dacl_sddl(path: &Path) -> io::Result<String> {
-    let wide = to_wide(path);
-    let info = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
-
-    let mut owner = ptr::null_mut();
-    let mut dacl = ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: `descriptor` receives memory that has to be freed with `LocalFree`, `owner`
-    // and `dacl` point into it
-    let rc = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
-            SE_FILE_OBJECT,
-            info,
-            &mut owner,
-            ptr::null_mut(),
-            &mut dacl,
-            ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if rc != ERROR_SUCCESS {
-        return Err(io::Error::from_raw_os_error(rc as i32));
-    }
-    let descriptor = LocalMem(descriptor);
-
-    let mut sddl: PWSTR = ptr::null_mut();
-    // SAFETY: `sddl` receives memory that has to be freed with `LocalFree`
-    if unsafe {
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            descriptor.0,
-            SDDL_REVISION_1,
-            info,
-            &mut sddl,
-            ptr::null_mut(),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let sddl = LocalMem(sddl.cast());
-
-    // SAFETY: On success this is a NUL terminated wide string
-    let sddl = unsafe { from_wide_ptr(sddl.0.cast()) };
-    sddl.into_string()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid SDDL"))
-}
-
-/// Creates a private directory that only the current user and `SYSTEM` can access.
-///
-/// `first` is tried first. If it already exists a new random name in the same parent
-/// directory is tried, a few times. An existing directory is never reused, as someone else
-/// may control it.
-pub fn create_private_dir_at(first: &Path) -> io::Result<PathBuf> {
-    let parent = first
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no parent directory"))?;
-    let sddl = private_dir_sddl(&current_user_sid()?);
-
-    let mut candidate = first.to_path_buf();
-    let mut last_err = None;
-
-    for _ in 0..PRIVATE_DIR_ATTEMPTS {
-        match create_dir_with_sddl(&candidate, &sddl) {
-            Ok(()) => return Ok(candidate),
-            Err(err) if err.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) => {
-                last_err = Some(err);
-                candidate = parent.join(private_dir_name(uuid::Uuid::new_v4()));
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists)))
-}
-
-/// Creates a private directory with a random name in `parent`.
-pub fn create_private_dir(parent: &Path) -> io::Result<PathBuf> {
-    create_private_dir_at(&parent.join(private_dir_name(uuid::Uuid::new_v4())))
-}
-
-/// Returns the parent directory for private socket directories, `<Windows>\Temp`.
-///
-/// This is not the user's temporary directory, which is what `GetTempPath2W` returns for
-/// processes not running as `SYSTEM`.
-pub fn private_dir_parent() -> io::Result<PathBuf> {
-    Ok(windows_dir()?.join("Temp"))
-}
-
 /// Gathers the facts needed to choose the socket directory of a packaged process.
 pub fn package_dirs(package_family_name: &str) -> PackageDirs {
     let temp_state_long = temp_state_dir(package_family_name)
@@ -398,237 +215,43 @@ pub fn package_dirs(package_family_name: &str) -> PackageDirs {
         .as_deref()
         .and_then(|dir| short_path_name(dir).ok());
 
-    let private_dir = private_dir_parent()
-        .ok()
-        .map(|parent| parent.join(private_dir_name(uuid::Uuid::new_v4())));
-
     PackageDirs {
         temp_state_long,
         temp_state_short,
-        private_dir,
     }
 }
 
 /// Returns the socket name for a packaged process, or `None` if the process has no package
-/// identity or no packaged location works.
+/// identity or the socket doesn't fit into `TempState`.
 pub fn packaged_socket_name(session_id: uuid::Uuid) -> Option<OwnedSocketName> {
     let package_family_name = package_family_name().ok()??;
     let file_name = packaged_socket_file_name(session_id);
 
     match choose_socket_dir(Some(&package_dirs(&package_family_name)), &file_name) {
         SocketDir::Existing(dir) => Some(OwnedSocketName::Path(dir.join(file_name))),
-        SocketDir::CreatePrivate(dir) => {
-            let dir = create_private_dir_at(&dir).ok()?;
-            let path = dir.join(&file_name);
-            if fits(&path) {
-                Some(OwnedSocketName::Path(path))
-            } else {
-                let _ = std::fs::remove_dir(&dir);
-                None
-            }
-        }
         SocketDir::SystemTemp => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
-    use crate::socket_dir::is_private_dir_name;
-
-    /// An ACE of a private directory as seen by the test.
-    struct AceCheck {
-        /// Allows full access, inherited by files and directories
-        full_access_inherited: bool,
-        is_user: bool,
-        is_system: bool,
-    }
-
-    /// The parts of a security descriptor the private directory test checks.
-    struct DirSecurity {
-        owner_is_user: bool,
-        dacl_protected: bool,
-        aces: Vec<AceCheck>,
-    }
-
-    /// Reads the owner and DACL of `path` and compares the SIDs in it with `EqualSid`, so
-    /// the result doesn't depend on how SIDs are abbreviated in SDDL.
-    fn dir_security(path: &Path) -> DirSecurity {
-        use windows_sys::Win32::{
-            Security::{
-                AclSizeInformation, Authorization::ConvertStringSidToSidW, EqualSid, GetAce,
-                GetAclInformation, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, ACL,
-                ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE, SE_DACL_PROTECTED,
-            },
-            Storage::FileSystem::FILE_ALL_ACCESS,
-        };
-
-        /// `ACCESS_ALLOWED_ACE_TYPE`, which needs another `windows-sys` feature
-        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-
-        let user = CurrentTokenUser::get().unwrap();
-
-        let system_string: Vec<u16> = "S-1-5-18".encode_utf16().chain(Some(0)).collect();
-        let mut system: PSID = ptr::null_mut();
-        // SAFETY: `system` receives memory that has to be freed with `LocalFree`
-        assert_ne!(
-            unsafe { ConvertStringSidToSidW(system_string.as_ptr(), &mut system) },
-            0
-        );
-        let system = LocalMem(system);
-
-        let wide = to_wide(path);
-        let mut owner: PSID = ptr::null_mut();
-        let mut dacl: *mut ACL = ptr::null_mut();
-        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-        // SAFETY: `owner` and `dacl` point into `descriptor`, which is freed last
-        let rc = unsafe {
-            GetNamedSecurityInfoW(
-                wide.as_ptr(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner,
-                ptr::null_mut(),
-                &mut dacl,
-                ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        assert_eq!(rc, ERROR_SUCCESS);
-        let descriptor = LocalMem(descriptor);
-        assert!(!dacl.is_null(), "no DACL");
-
-        // SAFETY: Both SIDs are valid
-        let owner_is_user = unsafe { EqualSid(owner, user.sid()) } != 0;
-
-        let mut control = 0u16;
-        let mut revision = 0u32;
-        // SAFETY: The descriptor is valid
-        assert_ne!(
-            unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) },
-            0
-        );
-
-        let mut size_info = ACL_SIZE_INFORMATION {
-            AceCount: 0,
-            AclBytesInUse: 0,
-            AclBytesFree: 0,
-        };
-        // SAFETY: The DACL is valid and the buffer has the right size
-        assert_ne!(
-            unsafe {
-                GetAclInformation(
-                    dacl,
-                    (&mut size_info as *mut ACL_SIZE_INFORMATION).cast(),
-                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-                    AclSizeInformation,
-                )
-            },
-            0
-        );
-
-        let inherit = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
-        let aces = (0..size_info.AceCount)
-            .map(|index| {
-                let mut ace: *mut c_void = ptr::null_mut();
-                // SAFETY: The index is within the ACE count
-                assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
-                let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
-
-                // SAFETY: Every ACE starts with a header
-                let header = unsafe { (*ace).Header };
-                if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
-                    return AceCheck {
-                        full_access_inherited: false,
-                        is_user: false,
-                        is_system: false,
-                    };
-                }
-
-                // SAFETY: This is an allow ACE, its SID starts at `SidStart`
-                let (mask, sid) = unsafe {
-                    (
-                        (*ace).Mask,
-                        ptr::addr_of_mut!((*ace).SidStart).cast::<c_void>(),
-                    )
-                };
-                // SAFETY: All SIDs are valid
-                let (is_user, is_system) =
-                    unsafe { (EqualSid(sid, user.sid()) != 0, EqualSid(sid, system.0) != 0) };
-
-                AceCheck {
-                    full_access_inherited: mask == FILE_ALL_ACCESS && header.AceFlags == inherit,
-                    is_user,
-                    is_system,
-                }
-            })
-            .collect();
-
-        DirSecurity {
-            owner_is_user,
-            dacl_protected: control & SE_DACL_PROTECTED != 0,
-            aces,
-        }
-    }
+    use crate::socket_dir::fits;
 
     #[test]
-    fn private_dir_is_owned_by_user_and_only_accessible_by_user_and_system() {
-        let parent = private_dir_parent().unwrap();
+    fn local_app_data_dir_matches_environment() {
+        let dir = local_app_data_dir().unwrap();
+        assert!(dir.is_dir(), "{dir:?}");
 
-        let dir = create_private_dir(&parent).unwrap();
-        let security = dir_security(&dir);
-        let sddl = owner_and_dacl_sddl(&dir);
-        let removed = fs::remove_dir(&dir);
-
-        assert!(dir.starts_with(&parent));
-        assert!(is_private_dir_name(dir.file_name().unwrap()));
-
-        let sddl = sddl.expect("SDDL should be readable");
-        assert!(security.owner_is_user, "{sddl}");
-        assert!(security.dacl_protected, "{sddl}");
-
-        // Every ACE grants full access to the user or SYSTEM. When running as SYSTEM, both
-        // may be the same ACE.
-        assert!(!security.aces.is_empty(), "{sddl}");
-        for ace in &security.aces {
-            assert!(ace.full_access_inherited, "{sddl}");
-            assert!(ace.is_user || ace.is_system, "{sddl}");
+        // Both are the long form, inside and outside of packages
+        if let Some(env) = std::env::var_os("LOCALAPPDATA") {
+            assert_eq!(dir, PathBuf::from(env));
         }
-        assert!(security.aces.iter().any(|ace| ace.is_user), "{sddl}");
-        assert!(security.aces.iter().any(|ace| ace.is_system), "{sddl}");
-
-        removed.expect("private directory should be removable");
-        assert!(!dir.exists());
-    }
-
-    #[test]
-    fn private_dirs_are_unique() {
-        let parent = private_dir_parent().unwrap();
-
-        let first = create_private_dir(&parent).unwrap();
-        let second = create_private_dir(&parent);
-        // Asking for an existing directory never reuses it
-        let third = create_private_dir_at(&first);
-
-        let _ = fs::remove_dir(&first);
-        if let Ok(second) = &second {
-            let _ = fs::remove_dir(second);
-        }
-        if let Ok(third) = &third {
-            let _ = fs::remove_dir(third);
-        }
-
-        let second = second.unwrap();
-        let third = third.unwrap();
-        assert_ne!(first, second);
-        assert_ne!(first, third);
     }
 
     #[test]
     fn short_path_name_of_existing_dir() {
-        for dir in [windows_dir().unwrap(), std::env::temp_dir()] {
+        for dir in [local_app_data_dir().unwrap(), std::env::temp_dir()] {
             let short = short_path_name(&dir).unwrap();
             assert!(!short.as_os_str().is_empty());
             assert!(short.is_dir(), "{short:?} from {dir:?}");
@@ -637,7 +260,7 @@ mod tests {
 
     #[test]
     fn short_path_name_of_missing_path_fails() {
-        let missing = std::env::temp_dir().join(private_dir_name(uuid::Uuid::new_v4()));
+        let missing = std::env::temp_dir().join(format!("mdct-{}", uuid::Uuid::new_v4().simple()));
         assert!(short_path_name(&missing).is_err());
     }
 
@@ -664,28 +287,35 @@ mod tests {
                 let Some(OwnedSocketName::Path(path)) = socket_name else {
                     panic!("expected a packaged socket path, got {socket_name:?}");
                 };
-                crate::socket_dir::remove_private_socket_dir(&OwnedSocketName::Path(path.clone()));
 
                 assert!(fits(&path), "{path:?}");
                 let dir = path.parent().unwrap();
                 let temp_state = temp_state_dir(&package_family_name).unwrap();
-                let in_temp_state =
-                    dir == temp_state || Some(dir) == short_path_name(&temp_state).ok().as_deref();
-                let in_private_dir = is_private_dir_name(dir.file_name().unwrap());
-                assert!(in_temp_state || in_private_dir, "{path:?}");
+                let short = short_path_name(&temp_state).ok();
+                assert!(
+                    dir == temp_state || Some(dir) == short.as_deref(),
+                    "{path:?}"
+                );
             }
         }
     }
 
     #[test]
-    fn app_socket_name_is_unchanged_without_package_identity() {
-        let socket_name = crate::app_socket_name();
-        let OwnedSocketName::Path(path) = &socket_name;
+    fn app_socket_name_is_unchanged_without_packaged_location() {
+        let OwnedSocketName::Path(path) = crate::app_socket_name();
         let name = path.file_name().unwrap().to_str().unwrap().to_owned();
         let parent = path.parent().map(Path::to_path_buf);
-        crate::socket_dir::remove_private_socket_dir(&socket_name);
 
-        if package_family_name().unwrap().is_none() {
+        // Packaged processes only fall back to the original name if `TempState` doesn't fit
+        let packaged = package_family_name()
+            .unwrap()
+            .is_some_and(|package_family_name| {
+                let file_name = packaged_socket_file_name(uuid::Uuid::nil());
+                let dirs = package_dirs(&package_family_name);
+                choose_socket_dir(Some(&dirs), &file_name) != SocketDir::SystemTemp
+            });
+
+        if !packaged {
             assert_eq!(parent, Some(std::env::temp_dir()), "{path:?}");
             let id = name.strip_prefix("temp-socket-").expect(&name);
             assert_eq!(id.len(), 32, "{name}");

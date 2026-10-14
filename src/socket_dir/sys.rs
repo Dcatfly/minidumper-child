@@ -46,7 +46,7 @@ mod bindings {
     pub const ERROR_SUCCESS: i32 = 0;
 
     #[link(name = "kernel32")]
-    unsafe extern "system" {
+    extern "system" {
         /// `LONG GetCurrentPackageFamilyName(UINT32 *packageFamilyNameLength,
         /// PWSTR packageFamilyName)` from `appmodel.h`.
         ///
@@ -67,7 +67,7 @@ mod bindings {
     }
 
     #[link(name = "shell32")]
-    unsafe extern "system" {
+    extern "system" {
         /// `HRESULT SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags,
         /// HANDLE hToken, PWSTR *ppszPath)` from `ShlObj_core.h`
         pub fn SHGetKnownFolderPath(
@@ -79,7 +79,7 @@ mod bindings {
     }
 
     #[link(name = "ole32")]
-    unsafe extern "system" {
+    extern "system" {
         /// `void CoTaskMemFree(LPVOID pv)` from `combaseapi.h`, in `Ole32.lib`.
         ///
         /// `windows-sys` links it from `combase.dll`, which `ole32.dll` forwards it to, and
@@ -243,10 +243,55 @@ mod tests {
         let dir = local_app_data_dir().unwrap();
         assert!(dir.is_dir(), "{dir:?}");
 
-        // Both are the long form, inside and outside of packages
+        // Both are the long form, inside and outside of packages. Windows paths are case
+        // insensitive, so only the case of each component may differ.
         if let Some(env) = std::env::var_os("LOCALAPPDATA") {
-            assert_eq!(dir, PathBuf::from(env));
+            let env = PathBuf::from(env);
+            assert!(paths_equal_ignoring_case(&dir, &env), "{dir:?} != {env:?}");
         }
+    }
+
+    /// Compares two paths component by component, ignoring case.
+    fn paths_equal_ignoring_case(a: &Path, b: &Path) -> bool {
+        let a: Vec<_> = a.components().collect();
+        let b: Vec<_> = b.components().collect();
+        a.len() == b.len()
+            && a.iter().zip(&b).all(|(a, b)| {
+                match (a.as_os_str().to_str(), b.as_os_str().to_str()) {
+                    (Some(a), Some(b)) => a.to_lowercase() == b.to_lowercase(),
+                    _ => a == b,
+                }
+            })
+    }
+
+    #[test]
+    fn paths_equal_ignoring_case_only_ignores_case() {
+        let dir = Path::new(r"C:\Users\Me\AppData\Local");
+        assert!(paths_equal_ignoring_case(
+            dir,
+            Path::new(r"c:\users\me\appdata\local")
+        ));
+        assert!(paths_equal_ignoring_case(
+            dir,
+            Path::new(r"C:\Users\Me\AppData\Local\")
+        ));
+
+        assert!(!paths_equal_ignoring_case(
+            dir,
+            Path::new(r"C:\Users\Me\AppData\Roaming")
+        ));
+        assert!(!paths_equal_ignoring_case(
+            dir,
+            Path::new(r"C:\Users\Me\AppData")
+        ));
+        assert!(!paths_equal_ignoring_case(
+            dir,
+            Path::new(r"C:\Users\Me\AppData\Local\x")
+        ));
+        assert!(!paths_equal_ignoring_case(
+            dir,
+            Path::new(r"C:\Users\Me\AppData\LocalLow")
+        ));
     }
 
     #[test]

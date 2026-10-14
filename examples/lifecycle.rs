@@ -13,6 +13,7 @@ use std::{
 };
 
 use minidumper_child::MinidumperChild;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 const SERVER_ENV: &str = "_CRASH_REPORTER_SERVER";
 /// Only ever set on the crash reporter process, via `on_process`
@@ -30,7 +31,8 @@ fn env_millis(name: &str) -> Option<Duration> {
 ///
 /// Like a server whose socket the client can't open, it leaves a file at the socket path,
 /// so the test can check that a failed `spawn()` removes it. It then writes its pid and the
-/// socket path to the report file and sleeps until it is killed.
+/// socket path to the report file and sleeps until it is killed. The report also includes the
+/// process start time, so the test can tell this process from one that reused its pid.
 fn run_stub_server() -> ! {
     let socket_name = env::var(SERVER_ENV).expect("socket name should be valid UTF-8");
 
@@ -43,8 +45,25 @@ fn run_stub_server() -> ! {
     let socket_path = socket_path
         .map(|path| path.display().to_string())
         .unwrap_or_default();
-    let report = env::var_os(STUB_REPORT_ENV).expect("report path should be set");
-    fs::write(report, format!("{}\n{socket_path}", process::id())).expect("failed to write report");
+    let pid = process::id();
+    let mut system = System::new();
+    let sys_pid = Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sys_pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    let start_time = system
+        .process(sys_pid)
+        .expect("should find own process")
+        .start_time();
+
+    // Write to a temporary file first so the test never reads a partial report
+    let report = PathBuf::from(env::var_os(STUB_REPORT_ENV).expect("report path should be set"));
+    let partial = report.with_extension("partial");
+    fs::write(&partial, format!("{pid}\n{start_time}\n{socket_path}"))
+        .expect("failed to write report");
+    fs::rename(&partial, &report).expect("failed to write report");
 
     loop {
         std::thread::sleep(Duration::from_secs(60));

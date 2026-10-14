@@ -20,7 +20,7 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(name: &str) -> Self {
-        let path = env::temp_dir().join(format!("mdc-{name}-{}", std::process::id()));
+        let path = env::temp_dir().join(format!("mdct-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("failed to create temp dir");
         Self(path)
@@ -33,11 +33,15 @@ impl Drop for TempDir {
     }
 }
 
+fn cargo() -> Command {
+    Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+}
+
 /// Builds the example up front so that compiling it doesn't eat into any timeouts.
 fn build_example() {
     static BUILD: Once = Once::new();
     BUILD.call_once(|| {
-        let status = Command::new("cargo")
+        let status = cargo()
             .args(["build", "--example", "lifecycle"])
             .status()
             .expect("failed to run cargo build");
@@ -47,7 +51,7 @@ fn build_example() {
 
 fn example() -> Command {
     build_example();
-    let mut command = Command::new("cargo");
+    let mut command = cargo();
     command
         .args(["run", "--quiet", "--example", "lifecycle"])
         .env_remove(SERVER_ENV)
@@ -55,7 +59,8 @@ fn example() -> Command {
     command
 }
 
-fn process_alive(pid: u32) -> bool {
+/// Returns the start time of the process with `pid`, if it is running.
+fn process_start_time(pid: u32) -> Option<u64> {
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -63,10 +68,11 @@ fn process_alive(pid: u32) -> bool {
         true,
         ProcessRefreshKind::nothing(),
     );
-    system.process(pid).is_some()
+    system.process(pid).map(|process| process.start_time())
 }
 
-fn kill_process(pid: u32) {
+/// Kills the process with `pid` if it is running and was started at `start_time`.
+fn kill_process(pid: u32, start_time: u64) {
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -75,7 +81,9 @@ fn kill_process(pid: u32) {
         ProcessRefreshKind::nothing(),
     );
     if let Some(process) = system.process(pid) {
-        process.kill();
+        if process.start_time() == start_time {
+            process.kill();
+        }
     }
 }
 
@@ -156,39 +164,47 @@ impl Running {
 
 #[test]
 fn client_connect_failure_terminates_server_process() {
-    // Make sure that `process_alive` can actually see a live process
-    assert!(process_alive(std::process::id()));
+    // Make sure that `process_start_time` can actually see a live process
+    assert!(process_start_time(std::process::id()).is_some());
 
     let dir = TempDir::new("conn");
     let report = dir.0.join("report");
 
     let mut command = example();
     command
-        .env("LIFECYCLE_CONNECT_TIMEOUT_MS", "1500")
+        .env("LIFECYCLE_CONNECT_TIMEOUT_MS", "4000")
         .env("LIFECYCLE_STUB_REPORT", &report);
 
-    let output = command
-        .spawn()
-        .expect("failed to spawn example")
-        .wait_with_output()
-        .expect("failed to wait for example");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Use a timeout rather than waiting for stdout to close: on Windows the server process
+    // may inherit the stdout pipe, so a server that isn't terminated would hang the test.
+    let mut running = Running::spawn(command);
+    let (status, _) = running.wait_for_exit(Duration::from_secs(120));
+    let stdout = running.output();
 
-    assert!(output.status.success(), "example failed: {stdout}");
+    assert!(status.success(), "example failed: {stdout:?}");
     assert!(
-        stdout.contains("SPAWN_ERR CreateClient"),
-        "spawn() should fail to connect: {stdout}"
+        stdout
+            .iter()
+            .any(|line| line.starts_with("SPAWN_ERR CreateClient")),
+        "spawn() should fail to connect: {stdout:?}"
     );
 
     // The stub server writes the report after creating the file at its socket path, so
     // this also proves that the file existed
     let report = fs::read_to_string(&report).expect("stub server should have written a report");
-    let (pid, socket_path) = report.split_once('\n').expect("malformed report");
-    let pid: u32 = pid.parse().expect("malformed pid");
+    let mut report = report.splitn(3, '\n');
+    let pid: u32 = report.next().unwrap().parse().expect("malformed pid");
+    let start_time: u64 = report
+        .next()
+        .expect("missing start time")
+        .parse()
+        .expect("malformed start time");
+    let socket_path = report.next().expect("missing socket path");
 
-    let alive = process_alive(pid);
+    // A process with the same pid but a different start time is an unrelated process
+    let alive = process_start_time(pid) == Some(start_time);
     if alive {
-        kill_process(pid);
+        kill_process(pid, start_time);
     }
     let socket_exists = !socket_path.is_empty() && Path::new(socket_path).exists();
     if socket_exists {
@@ -253,15 +269,15 @@ fn run_unconnected_server(
 
 #[test]
 fn server_exits_when_no_client_connects() {
-    let (status, ran_for, output) = run_unconnected_server("idle", 500, 1500);
+    let (status, ran_for, output) = run_unconnected_server("idle", 500, 2500);
 
     assert_eq!(status.code(), Some(0), "output: {output:?}");
     assert!(
-        ran_for >= Duration::from_millis(1500),
+        ran_for >= Duration::from_millis(2500),
         "server exited after {ran_for:?}, before its connect timeout"
     );
     assert!(
-        ran_for < Duration::from_millis(1500) + Duration::from_secs(5),
+        ran_for < Duration::from_millis(2500) + Duration::from_secs(5),
         "server took {ran_for:?} to exit"
     );
     assert!(!output.iter().any(|line| line == "APP_CODE_RAN"));
@@ -269,13 +285,14 @@ fn server_exits_when_no_client_connects() {
 
 #[test]
 fn server_waits_longer_than_client_connect_timeout() {
-    // A server connect timeout shorter than the client connect timeout is not honoured
+    // A server connect timeout shorter than the client connect timeout is not honoured,
+    // the server waits at least one second longer than the client
     let (status, ran_for, output) = run_unconnected_server("wait", 2000, 100);
 
     assert_eq!(status.code(), Some(0), "output: {output:?}");
     assert!(
-        ran_for > Duration::from_millis(2000),
-        "server exited after {ran_for:?}, before the client connect timeout"
+        ran_for >= Duration::from_millis(3000),
+        "server exited after {ran_for:?}, too soon after the client connect timeout"
     );
     assert!(!output.iter().any(|line| line == "APP_CODE_RAN"));
 }

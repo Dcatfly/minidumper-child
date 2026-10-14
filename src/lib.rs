@@ -1,5 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
+    io::Write,
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     process,
     sync::Arc,
@@ -64,12 +66,15 @@ pub struct MinidumperChild {
     on_message: Option<OnMessage>,
 }
 
+/// The default for [`MinidumperChild::with_client_connect_timeout`].
+const DEFAULT_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_millis(3000);
+
 impl Default for MinidumperChild {
     fn default() -> Self {
         Self {
             crashes_dir: std::env::temp_dir().join("Crashes"),
             server_stale_timeout: Duration::from_millis(5000),
-            client_connect_timeout: Duration::from_millis(3000),
+            client_connect_timeout: DEFAULT_CLIENT_CONNECT_TIMEOUT,
             server_connect_timeout: None,
             server_env: "_CRASH_REPORTER_SERVER".to_owned(),
             on_process: None,
@@ -154,10 +159,10 @@ impl MinidumperChild {
     /// so it can't be left behind when the app process fails to connect or dies before
     /// connecting.
     ///
-    /// The value must be strictly greater than the client connect timeout (see
-    /// [`MinidumperChild::with_client_connect_timeout`]) so that a client that connects
-    /// late, but still within its own timeout, is never cut off. Values that are not
-    /// strictly greater are ignored and the default is used instead.
+    /// The value must be more than one second longer than the client connect timeout (see
+    /// [`MinidumperChild::with_client_connect_timeout`]) so that a client that is slow to
+    /// connect, but still within its own timeout, isn't cut off. Other values are ignored
+    /// and the default is used instead.
     ///
     /// Defaults to twice the client connect timeout, and at least one second more than it.
     #[must_use = "You should call spawn() or the crash reporter won't be enabled"]
@@ -185,27 +190,37 @@ impl MinidumperChild {
             // This is the crash reporter process. It must never return to the caller,
             // otherwise the app code after `spawn()` would run in the crash reporter
             // process too, so every outcome ends in an explicit exit.
-            let Some(socket_name) = OwnedSocketName::from_os_str(&socket_name) else {
-                eprintln!("{}", Error::InvalidSocketName(socket_name));
-                std::process::exit(1);
+            //
+            // Panics, e.g. from the `on_minidump` or `on_message` callbacks, are caught so
+            // they don't unwind into the caller either. The panic hook still runs first,
+            // and this has no effect when built with `panic = "abort"`.
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let socket_name = OwnedSocketName::from_os_str(&socket_name)
+                    .ok_or_else(|| Error::InvalidSocketName(socket_name.clone()))?;
+
+                let connect_grace =
+                    server_connect_grace(self.client_connect_timeout, self.server_connect_timeout);
+
+                server::start_with_connect_grace(
+                    socket_name,
+                    self.crashes_dir,
+                    self.server_stale_timeout,
+                    connect_grace,
+                    self.on_minidump,
+                    self.on_message,
+                )
+            }));
+
+            let code = match result {
+                Ok(Ok(())) => 0,
+                Ok(Err(err)) => {
+                    write_error(&err);
+                    1
+                }
+                Err(_) => 1,
             };
 
-            let connect_grace =
-                server_connect_grace(self.client_connect_timeout, self.server_connect_timeout);
-
-            if let Err(err) = server::start(
-                socket_name,
-                self.crashes_dir,
-                self.server_stale_timeout,
-                connect_grace,
-                self.on_minidump,
-                self.on_message,
-            ) {
-                eprintln!("{err}");
-                std::process::exit(1);
-            }
-
-            std::process::exit(0);
+            std::process::exit(code);
         } else {
             // We use a unique socket name because we don't share the crash reporter
             // processes between different instances of the app.
@@ -246,6 +261,21 @@ impl MinidumperChild {
     }
 }
 
+/// Writes an error and its sources to stderr.
+///
+/// Unlike `eprintln!` this doesn't panic if stderr is closed.
+fn write_error(err: &dyn std::error::Error) {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(err) = source {
+        message.push_str(": ");
+        message.push_str(&err.to_string());
+        source = err.source();
+    }
+
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
 /// Kills the server process, waits for it to exit and removes its socket file.
 ///
 /// This is best effort: errors are ignored because the caller is already returning an error.
@@ -263,31 +293,32 @@ fn terminate_server(server_process: &mut process::Child, socket_name: &OwnedSock
     }
 }
 
-/// The minimum amount by which the default server connect grace period exceeds the client
-/// connect timeout.
+/// The minimum amount by which the server connect grace period exceeds the client connect
+/// timeout.
 const MIN_SERVER_CONNECT_MARGIN: Duration = Duration::from_secs(1);
 
 /// Returns how long the server waits for the first client before exiting on its own.
 ///
-/// The result is always strictly greater than `client_connect_timeout`. The client starts
-/// its timer before the server process is spawned, while the server starts its timer after
-/// binding the socket, so with a longer grace period the client always gives up first.
-/// There is no window in which the server gives up on a client that is about to connect.
+/// The result is always at least [`MIN_SERVER_CONNECT_MARGIN`] longer than
+/// `client_connect_timeout`. The client starts its timer before the server process is
+/// spawned, while the server starts its timer after binding the socket, so the server only
+/// gives up on a client that is still trying to connect if the client overshoots its own
+/// timeout by more than the margin. That can happen because the client timeout only counts
+/// the time slept between attempts, not the time spent in each attempt, but should not in
+/// practice.
 ///
-/// The client timeout only counts the time slept between attempts, not the time spent in
-/// each attempt or in starting the server process, so the default leaves plenty of room:
-/// twice the client timeout, and at least [`MIN_SERVER_CONNECT_MARGIN`] more than it for
-/// short timeouts. A `configured` value is used as-is if it is strictly greater than the
-/// client timeout, otherwise it is replaced by the default.
+/// The default is twice the client timeout, and at least the margin more than it for short
+/// timeouts. A `configured` value is used as-is if it is more than the margin longer than
+/// the client timeout, otherwise the default is used instead.
 fn server_connect_grace(
     client_connect_timeout: Duration,
     configured: Option<Duration>,
 ) -> Duration {
+    let minimum = client_connect_timeout.saturating_add(MIN_SERVER_CONNECT_MARGIN);
+
     match configured {
-        Some(configured) if configured > client_connect_timeout => configured,
-        _ => client_connect_timeout
-            .saturating_mul(2)
-            .max(client_connect_timeout.saturating_add(MIN_SERVER_CONNECT_MARGIN)),
+        Some(configured) if configured > minimum => configured,
+        _ => client_connect_timeout.saturating_mul(2).max(minimum),
     }
 }
 
@@ -378,7 +409,7 @@ mod tests {
 
     use uuid::Uuid;
 
-    use crate::{server_connect_grace, OwnedSocketName};
+    use crate::{server_connect_grace, OwnedSocketName, MIN_SERVER_CONNECT_MARGIN};
 
     #[test]
     fn owned_socket_name_roundtrip_new() {
@@ -436,27 +467,44 @@ mod tests {
     }
 
     #[test]
-    fn server_connect_grace_uses_configured_value_when_greater() {
-        let grace = server_connect_grace(Duration::from_secs(3), Some(Duration::from_secs(4)));
-        assert_eq!(grace, Duration::from_secs(4));
+    fn server_connect_grace_uses_configured_value_greater_than_minimum() {
+        let grace = server_connect_grace(Duration::from_secs(3), Some(Duration::from_secs(5)));
+        assert_eq!(grace, Duration::from_secs(5));
+
+        let just_over = Duration::from_secs(4) + Duration::from_nanos(1);
+        let grace = server_connect_grace(Duration::from_secs(3), Some(just_over));
+        assert_eq!(grace, just_over);
     }
 
     #[test]
-    fn server_connect_grace_raises_configured_value_not_greater_than_connect_timeout() {
+    fn server_connect_grace_replaces_configured_value_not_greater_than_minimum() {
         let connect = Duration::from_secs(3);
 
-        for configured in [Duration::ZERO, Duration::from_secs(1), connect] {
+        // Anything up to and including the connect timeout plus the margin is replaced
+        for configured in [
+            Duration::ZERO,
+            Duration::from_secs(1),
+            connect,
+            connect + Duration::from_millis(500),
+            connect + MIN_SERVER_CONNECT_MARGIN,
+        ] {
             let grace = server_connect_grace(connect, Some(configured));
-            assert!(grace > connect, "{configured:?} was not raised: {grace:?}");
-            assert_eq!(grace, Duration::from_secs(6));
+            assert_eq!(
+                grace,
+                Duration::from_secs(6),
+                "{configured:?} was not replaced"
+            );
         }
     }
 
     #[test]
-    fn server_connect_grace_is_always_greater_than_connect_timeout() {
+    fn server_connect_grace_always_exceeds_connect_timeout_by_margin() {
         for millis in [0, 1, 50, 999, 1000, 3000, 60_000] {
             let connect = Duration::from_millis(millis);
-            assert!(server_connect_grace(connect, None) > connect);
+            for configured in [None, Some(Duration::ZERO), Some(connect)] {
+                let grace = server_connect_grace(connect, configured);
+                assert!(grace >= connect + MIN_SERVER_CONNECT_MARGIN, "{connect:?}");
+            }
         }
     }
 }

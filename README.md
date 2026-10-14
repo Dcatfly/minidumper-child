@@ -38,3 +38,8 @@ fn main() {
     }
 }
 ```
+
+The crash reporter process exits on its own if the app process doesn't connect
+to it in time. This defaults to twice the client connect timeout and can be
+changed with `with_server_connect_timeout`, which must be more than one second
+longer than the client connect timeout (`with_client_connect_timeout`).

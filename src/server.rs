@@ -116,7 +116,34 @@ fn spawn_connect_watchdog(grace: Duration, connected: Arc<AtomicBool>, shutdown:
     });
 }
 
+/// Runs the server until the client disconnects or crashes.
+///
+/// Exits if no client connects within the grace period derived from the default client
+/// connect timeout. See [`start_with_connect_grace`] to configure it.
 pub fn start<Minidump, Message>(
+    socket_name: OwnedSocketName,
+    crashes_dir: PathBuf,
+    stale_timeout: Duration,
+    on_minidump: Option<Minidump>,
+    on_message: Option<Message>,
+) -> Result<(), Error>
+where
+    Minidump: Fn(Vec<u8>, &Path) + Send + Sync + 'static,
+    Message: Fn(u32, Vec<u8>) + Send + Sync + 'static,
+{
+    start_with_connect_grace(
+        socket_name,
+        crashes_dir,
+        stale_timeout,
+        crate::server_connect_grace(crate::DEFAULT_CLIENT_CONNECT_TIMEOUT, None),
+        on_minidump,
+        on_message,
+    )
+}
+
+/// Runs the server until the client disconnects or crashes, or until `connect_grace` has
+/// passed without a client connecting.
+pub fn start_with_connect_grace<Minidump, Message>(
     socket_name: OwnedSocketName,
     crashes_dir: PathBuf,
     stale_timeout: Duration,

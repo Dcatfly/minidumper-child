@@ -263,7 +263,7 @@ fn terminate_server(server_process: &mut process::Child, socket_name: &OwnedSock
     }
 }
 
-/// The minimum amount by which the server connect grace period exceeds the client
+/// The minimum amount by which the default server connect grace period exceeds the client
 /// connect timeout.
 const MIN_SERVER_CONNECT_MARGIN: Duration = Duration::from_secs(1);
 

@@ -236,17 +236,24 @@ impl MinidumperChild {
             // processes between different instances of the app.
             let socket_name = app_socket_name();
 
-            let mut server_process = std::env::current_exe()
-                .and_then(|current_exe| {
-                    let mut process = process::Command::new(current_exe);
-                    if let Some(on_process) = self.on_process {
-                        on_process(&mut process);
-                    }
-                    // Always set this last, so an accidental `env_clear()` doesn't remove it.
-                    process.env(self.server_env, socket_name.as_os_string());
-                    process.spawn()
-                })
-                .map_err(Error::SpawnProcess)?;
+            let server_process = std::env::current_exe().and_then(|current_exe| {
+                let mut process = process::Command::new(current_exe);
+                if let Some(on_process) = self.on_process {
+                    on_process(&mut process);
+                }
+                // Always set this last, so an accidental `env_clear()` doesn't remove it.
+                process.env(self.server_env, socket_name.as_os_string());
+                process.spawn()
+            });
+
+            let mut server_process = match server_process {
+                Ok(server_process) => server_process,
+                Err(err) => {
+                    // The socket directory may have been created for this server
+                    socket_dir::remove_private_socket_dir(&socket_name);
+                    return Err(Error::SpawnProcess(err));
+                }
+            };
 
             match client::start(
                 socket_name.clone(),

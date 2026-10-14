@@ -3,7 +3,10 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -15,6 +18,8 @@ where
     Message: Fn(u32, Vec<u8>) + Send + Sync + 'static,
 {
     crashes_dir: PathBuf,
+    /// Set once a client has connected, read by the connect watchdog
+    connected: Arc<AtomicBool>,
     on_minidump: Option<Minidump>,
     on_message: Option<Message>,
 }
@@ -26,11 +31,13 @@ where
 {
     pub fn new(
         crashes_dir: PathBuf,
+        connected: Arc<AtomicBool>,
         on_minidump: Option<Minidump>,
         on_message: Option<Message>,
     ) -> Self {
         Handler {
             crashes_dir,
+            connected,
             on_minidump,
             on_message,
         }
@@ -83,15 +90,37 @@ where
         }
     }
 
+    fn on_client_connected(&self, _num_clients: usize) -> minidumper::LoopAction {
+        self.connected.store(true, Ordering::SeqCst);
+        LoopAction::Continue
+    }
+
     fn on_client_disconnected(&self, _num_clients: usize) -> minidumper::LoopAction {
         LoopAction::Exit
     }
+}
+
+/// Exits the server loop if no client has connected within `grace`.
+///
+/// Once a client has connected, the stale timeout and the disconnect handler take care of
+/// exiting the server, but they never fire if no client ever connects. Without this the
+/// server process would run forever, e.g. when the client fails to connect or the app
+/// process dies before connecting.
+fn spawn_connect_watchdog(grace: Duration, connected: Arc<AtomicBool>, shutdown: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(grace);
+
+        if !connected.load(Ordering::SeqCst) {
+            shutdown.store(true, Ordering::SeqCst);
+        }
+    });
 }
 
 pub fn start<Minidump, Message>(
     socket_name: OwnedSocketName,
     crashes_dir: PathBuf,
     stale_timeout: Duration,
+    connect_grace: Duration,
     on_minidump: Option<Minidump>,
     on_message: Option<Message>,
 ) -> Result<(), Error>
@@ -99,14 +128,26 @@ where
     Minidump: Fn(Vec<u8>, &Path) + Send + Sync + 'static,
     Message: Fn(u32, Vec<u8>) + Send + Sync + 'static,
 {
+    // The server is dropped before returning, which removes its socket file. This has to
+    // happen here because the caller exits the process, which doesn't run destructors.
     Server::with_name(socket_name.as_ref())
         .map_err(|err| Error::CreateServer {
             source: err,
             socket_name,
         })
         .and_then(|mut server| {
-            let handler = Box::new(Handler::new(crashes_dir, on_minidump, on_message));
-            let shutdown = AtomicBool::new(false);
+            let connected = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            // The grace period starts once the socket is bound
+            spawn_connect_watchdog(connect_grace, connected.clone(), shutdown.clone());
+
+            let handler = Box::new(Handler::new(
+                crashes_dir,
+                connected,
+                on_minidump,
+                on_message,
+            ));
             let stale_timeout = Some(stale_timeout);
 
             server
